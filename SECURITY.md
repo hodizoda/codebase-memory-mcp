@@ -17,7 +17,7 @@ contents, environment variables, usage metrics, or telemetry.
 The MCP server has one best-effort external runtime check: after MCP
 `initialize`, it starts a background update-check thread that requests release
 metadata from
-`https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest`.
+`https://api.github.com/repos/hodizoda/codebase-memory-mcp/releases/latest`.
 That request is used only to show an update notice when a newer release exists.
 It sends no project data; only standard HTTPS metadata, such as the destination
 host and the normal `curl` request headers, are visible to GitHub and the
@@ -56,7 +56,7 @@ can fix it before public disclosure:
 
 1. **Do NOT open a public issue, PR, or social-media post** for security
    vulnerabilities.
-2. **Preferred:** use GitHub's [private vulnerability reporting](https://github.com/DeusData/codebase-memory-mcp/security/advisories/new)
+2. **Preferred:** use GitHub's [private vulnerability reporting](https://github.com/hodizoda/codebase-memory-mcp/security/advisories/new)
    (the repository's **Security → Report a vulnerability** button). This keeps
    everything in one place and starts a private advisory automatically.
 3. **Alternative:** email martin.vogel.tech@gmail.com.
@@ -81,7 +81,7 @@ can fix it before public disclosure:
 
 We follow **coordinated disclosure**: fixes are developed privately, validated
 across all supported platforms, released, and only then disclosed publicly via a
-[GitHub Security Advisory](https://github.com/DeusData/codebase-memory-mcp/security/advisories)
+[GitHub Security Advisory](https://github.com/hodizoda/codebase-memory-mcp/security/advisories)
 with a **CVE** and credit to you. The full handling process — including how you
 can verify the fix before release — is documented in
 [`docs/SECURITY-DISCLOSURE.md`](docs/SECURITY-DISCLOSURE.md).
@@ -155,8 +155,8 @@ Users can independently verify any release binary:
 ```bash
 # SLSA Build Level 3 provenance for release binaries
 gh attestation verify <downloaded-file> \
-  --repo DeusData/codebase-memory-mcp \
-  --signer-workflow DeusData/codebase-memory-mcp/.github/workflows/_build.yml
+  --repo hodizoda/codebase-memory-mcp \
+  --signer-workflow hodizoda/codebase-memory-mcp/.github/workflows/_build.yml
 
 # Sigstore cosign (keyless signature)
 cosign verify-blob --bundle <file>.bundle <file>

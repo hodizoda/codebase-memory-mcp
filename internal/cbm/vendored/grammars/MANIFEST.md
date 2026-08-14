@@ -219,7 +219,7 @@ the original "authored in-house" classification was too coarse — six of the
 twelve are self-maintained **forks** whose vendored LICENSE names the original
 upstream author (correctly retained). The table now records the true origin.
 
-### Authored in-house (project MIT, (c) DeusData)
+### Authored in-house (project MIT, (c) hodizoda)
 
 | grammar | cur ABI | LICENSE |
 |---|:---:|:---:|

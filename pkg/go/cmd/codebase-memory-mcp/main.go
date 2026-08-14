@@ -6,7 +6,7 @@
 //
 // Install:
 //
-//	go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest
+//	go install github.com/hodizoda/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest
 package main
 
 import (
@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	repo                = "DeusData/codebase-memory-mcp"
+	repo                = "hodizoda/codebase-memory-mcp"
 	version             = "0.8.1"
 	windowsLauncherName = "codebase-memory-mcp.exe"
 	windowsPayloadName  = "codebase-memory-mcp.payload.exe"
@@ -124,7 +124,7 @@ func printPortableMutationGuidance(args []string) {
 	if action == "" {
 		return
 	}
-	packageCommand := "go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest"
+	packageCommand := "go install github.com/hodizoda/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest"
 	if action == "uninstall" {
 		packageCommand = "Remove-Item (Get-Command codebase-memory-mcp).Source"
 	}

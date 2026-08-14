@@ -9,53 +9,53 @@
 # approval for the matching path.
 
 # Default owner gate: every pull request crosses the project owner's desk.
-* @DeusData
+* @hodizoda
 
 # Security-sensitive and authority-sensitive surfaces.
-/.github/ @DeusData
-/scripts/ @DeusData
-/Makefile.cbm @DeusData
-/SECURITY.md @DeusData
-/docs/SECURITY-DISCLOSURE.md @DeusData
-/CONTRIBUTING.md @DeusData
-/CODE_OF_CONDUCT.md @DeusData
-/DCO @DeusData
-/LICENSE @DeusData
-/MAINTAINERS.md @DeusData
+/.github/ @hodizoda
+/scripts/ @hodizoda
+/Makefile.cbm @hodizoda
+/SECURITY.md @hodizoda
+/docs/SECURITY-DISCLOSURE.md @hodizoda
+/CONTRIBUTING.md @hodizoda
+/CODE_OF_CONDUCT.md @hodizoda
+/DCO @hodizoda
+/LICENSE @hodizoda
+/MAINTAINERS.md @hodizoda
 
 # Release and distribution surfaces.
-/pkg/ @DeusData
-/install.sh @DeusData
-/install.ps1 @DeusData
-/server.json @DeusData
-/glama.json @DeusData
-/flake.nix @DeusData
-/flake.lock @DeusData
-/THIRD_PARTY.md @DeusData
-/vendored/ @DeusData
-/internal/cbm/vendored/ @DeusData
+/pkg/ @hodizoda
+/install.sh @hodizoda
+/install.ps1 @hodizoda
+/server.json @hodizoda
+/glama.json @hodizoda
+/flake.nix @hodizoda
+/flake.lock @hodizoda
+/THIRD_PARTY.md @hodizoda
+/vendored/ @hodizoda
+/internal/cbm/vendored/ @hodizoda
 
 # Core product surfaces.
-/src/foundation/ @DeusData
-/src/store/ @DeusData
-/src/cypher/ @DeusData
-/src/graph_buffer/ @DeusData
-/src/mcp/ @DeusData
-/src/cli/ @DeusData
-/src/discover/ @DeusData
-/src/watcher/ @DeusData
-/src/pipeline/ @DeusData
-/src/git/ @DeusData
-/src/semantic/ @DeusData
-/src/simhash/ @DeusData
-/src/traces/ @DeusData
-/src/ui/ @DeusData
+/src/foundation/ @hodizoda
+/src/store/ @hodizoda
+/src/cypher/ @hodizoda
+/src/graph_buffer/ @hodizoda
+/src/mcp/ @hodizoda
+/src/cli/ @hodizoda
+/src/discover/ @hodizoda
+/src/watcher/ @hodizoda
+/src/pipeline/ @hodizoda
+/src/git/ @hodizoda
+/src/semantic/ @hodizoda
+/src/simhash/ @hodizoda
+/src/traces/ @hodizoda
+/src/ui/ @hodizoda
 
 # Extraction, language support, and graph UI.
-/internal/cbm/ @DeusData
-/tools/ @DeusData
-/graph-ui/ @DeusData
+/internal/cbm/ @hodizoda
+/tools/ @hodizoda
+/graph-ui/ @hodizoda
 
 # Test and reproduction infrastructure.
-/tests/ @DeusData
-/test-infrastructure/ @DeusData
+/tests/ @hodizoda
+/test-infrastructure/ @hodizoda

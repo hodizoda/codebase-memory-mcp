@@ -442,6 +442,7 @@ TEST_EXTRACTION_SRCS = \
     tests/test_grammar_regression.c \
     tests/test_grammar_labels.c \
     tests/test_grammar_imports.c \
+    tests/test_sse_channels.c \
     tests/test_ac.c
 
 TEST_STORE_SRCS = \

@@ -609,6 +609,7 @@ extern void suite_subprocess(void);
 extern void suite_private_file_lock(void);
 extern void suite_lock_registry(void);
 extern void suite_extraction(void);
+extern void suite_sse_channels(void);
 extern void suite_extraction_inheritance(void);
 extern void suite_extraction_imports(void);
 extern void suite_parse_coverage(void);
@@ -841,6 +842,7 @@ int main(int argc, char **argv) {
     /* Existing C code regression tests */
     RUN_SELECTED_SUITE(ac);
     RUN_SELECTED_SUITE(extraction);
+    RUN_SELECTED_SUITE(sse_channels);
     RUN_SELECTED_SUITE(extraction_inheritance);
     RUN_SELECTED_SUITE(extraction_imports);
     RUN_SELECTED_SUITE(parse_coverage);

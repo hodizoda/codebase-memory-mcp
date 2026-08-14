@@ -10,6 +10,9 @@
  *   Ruby:      ActionCable (broadcast / stream_from)
  *   Elixir:    Phoenix.PubSub, Phoenix.Channel
  *   Rust:      tokio-tungstenite (sink.send / stream.next)
+ *   SSE:       EventSource / fetch-event-source (JS), sse-starlette /
+ *              sseclient (Python), text/event-stream handlers + r3labs/sse
+ *              (Go) — transport "sse", keyed by the stream URL path
  *
  * Transport is stored on the record ("socketio", "websocket", "kafka", etc.)
  * so later detectors can share the same schema without changing edge types.
@@ -34,6 +37,10 @@ enum {
     CHAN_IDENT_MAX = 128,  /* max identifier length tracked */
     CHAN_STACK_CAP = 4096, /* traversal stack depth per walk    */
     CHAN_DIR_UNKNOWN = -1, /* unrecognized method → no channel */
+
+    CHAN_SSE_WALK_CAP = 512,     /* initial stack for SSE subtree scans */
+    CHAN_SSE_ROUTE_ARGS = 2,     /* route registration: path + handler */
+    CHAN_URL_SCHEME_SEP_LEN = 3, /* strlen("://") */
 };
 
 typedef struct {
@@ -232,6 +239,20 @@ static const char *extract_channel_name(CBMExtractCtx *ctx, TSNode args,
     return channel_name;
 }
 
+/* Extract a string literal from the Nth named child of an args node. */
+static const char *nth_arg_literal(CBMExtractCtx *ctx, TSNode args, uint32_t index) {
+    uint32_t ac = ts_node_named_child_count(args);
+    if (ac <= index) {
+        return NULL;
+    }
+    TSNode arg = ts_node_named_child(args, index);
+    const char *val = literal_from_arg(ctx, arg);
+    if (!val) {
+        val = literal_from_first_child(ctx, arg);
+    }
+    return val;
+}
+
 /* ── Emit helper ─────────────────────────────────────────────────── */
 
 static void push_channel(CBMExtractCtx *ctx, const char *channel_name, const char *transport,
@@ -243,6 +264,483 @@ static void push_channel(CBMExtractCtx *ctx, const char *channel_name, const cha
         .direction = direction,
     };
     cbm_channels_push(&ctx->result->channels, ctx->arena, ch);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  SSE (Server-Sent Events) — cross-language transport "sse"
+ *
+ *  Channel identity is the URL path of the event-stream endpoint
+ *  ("/events"), so server emitters and client listeners in different
+ *  projects match by name in the cross-repo pass.  When no path can
+ *  be extracted, nothing is emitted — a wrong-keyed channel creates
+ *  false cross-repo links, which is worse than a missing one.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* ASCII case-insensitive equality (header names: "Content-Type" vs "content-type"). */
+static bool sse_ieq(const char *a, const char *b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + ('a' - 'A')) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + ('a' - 'A')) : *b;
+        if (ca != cb) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* Match "text/event-stream" with optional parameters ("; charset=utf-8").
+ * The media type must be followed by end-of-string, ';', or whitespace so
+ * unrelated strings like "text/event-streamfoo" do not match. */
+static bool sse_is_event_stream(const char *val) {
+    static const char mime[] = "text/event-stream";
+    if (!val || strncmp(val, mime, sizeof(mime) - SKIP_ONE) != 0) {
+        return false;
+    }
+    char next = val[sizeof(mime) - SKIP_ONE];
+    return next == '\0' || next == ';' || next == ' ' || next == '\t';
+}
+
+/* Extract the path component of a URL or bare path, dropping query/fragment:
+ * "http://host:8080/a/b?q=1" → "/a/b", "/events" → "/events".  Returns NULL
+ * when no path is present (bare host, relative string, template, …). */
+static const char *sse_url_path(CBMArena *a, const char *url) {
+    if (!url || !url[0]) {
+        return NULL;
+    }
+    const char *path = url;
+    const char *scheme = strstr(url, "://");
+    if (scheme) {
+        path = strchr(scheme + CHAN_URL_SCHEME_SEP_LEN, '/');
+        if (!path) {
+            return NULL;
+        }
+    }
+    if (path[0] != '/') {
+        return NULL;
+    }
+    return cbm_arena_strndup(a, path, strcspn(path, "?#"));
+}
+
+/* True when the subtree contains a "text/event-stream" STRING LITERAL.
+ * Only string nodes count — a mention in a comment never matches. */
+static bool sse_subtree_has_event_stream(CBMExtractCtx *ctx, TSNode root) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CHAN_SSE_WALK_CAP);
+    ts_nstack_push(&stack, ctx->arena, root);
+
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        const char *val = literal_from_arg(ctx, node);
+        if (val && sse_is_event_stream(val)) {
+            return true;
+        }
+        ts_nstack_push_children(&stack, ctx->arena, node);
+    }
+    return false;
+}
+
+/* ── SSE: JS/TS ──────────────────────────────────────────────────── */
+
+/* new EventSource("/events") — SSE listener.  Covers the browser API, the
+ * `eventsource` npm package, and event-source-polyfill (same constructor). */
+static void js_sse_process_new(CBMExtractCtx *ctx, TSNode new_expr,
+                               const chan_const_table_t *consts) {
+    TSNode ctor = ts_node_child_by_field_name(new_expr, TS_FIELD("constructor"));
+    if (ts_node_is_null(ctor) && ts_node_named_child_count(new_expr) > 0) {
+        ctor = ts_node_named_child(new_expr, 0);
+    }
+    if (ts_node_is_null(ctor)) {
+        return;
+    }
+    char *ctor_text = cbm_node_text(ctx->arena, ctor, ctx->source);
+    if (!ctor_text) {
+        return;
+    }
+    const char *tail = ctor_text;
+    const char *dot = strrchr(tail, '.');
+    if (dot) {
+        tail = dot + SKIP_ONE;
+    }
+    if (strcmp(tail, "EventSource") != 0 && strcmp(tail, "EventSourcePolyfill") != 0) {
+        return;
+    }
+    TSNode args = ts_node_child_by_field_name(new_expr, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return;
+    }
+    const char *path = sse_url_path(ctx->arena, extract_channel_name(ctx, args, consts));
+    if (!path) {
+        return;
+    }
+    push_channel(ctx, path, "sse", CBM_CHANNEL_LISTEN, new_expr);
+}
+
+/* Server-ish receivers whose .get() registers a route (same tail-gating idiom
+ * as js_classify_receiver, but for HTTP frameworks rather than message buses).
+ * HTTP *clients* (axios/got/ky) also expose .get(url, opts) — without this
+ * gate an SSE client request carrying "text/event-stream" in its headers
+ * would be recorded as an emitter, inverting the edge direction. */
+static bool js_sse_is_server_receiver(CBMExtractCtx *ctx, TSNode object_node) {
+    char *text = cbm_node_text(ctx->arena, object_node, ctx->source);
+    if (!text) {
+        return false;
+    }
+    const char *tail = text;
+    const char *dot = strrchr(tail, '.');
+    if (dot) {
+        tail = dot + SKIP_ONE;
+    }
+    return strcmp(tail, "app") == 0 || strcmp(tail, "router") == 0 ||
+           strcmp(tail, "server") == 0 || strcmp(tail, "api") == 0;
+}
+
+/* JS SSE call patterns:
+ *   fetchEventSource("/path", {…})    (@microsoft/fetch-event-source) → listener
+ *   app.get("/path", (req, res) => { … "text/event-stream" … })       → emitter
+ * The emitter form only fires when the event-stream media type appears as a
+ * string literal INSIDE the route registration (inline handler).  Handlers
+ * registered by reference are skipped — no reliable path → no channel. */
+static void js_sse_process_call(CBMExtractCtx *ctx, TSNode call,
+                                const chan_const_table_t *consts) {
+    TSNode func = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(func) || ts_node_is_null(args)) {
+        return;
+    }
+    const char *fk = ts_node_type(func);
+
+    if (strcmp(fk, "identifier") == 0) {
+        char *name = cbm_node_text(ctx->arena, func, ctx->source);
+        if (name && strcmp(name, "fetchEventSource") == 0) {
+            const char *path = sse_url_path(ctx->arena, extract_channel_name(ctx, args, consts));
+            if (path) {
+                push_channel(ctx, path, "sse", CBM_CHANNEL_LISTEN, call);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(fk, "member_expression") != 0) {
+        return;
+    }
+    TSNode object = ts_node_child_by_field_name(func, TS_FIELD("object"));
+    TSNode property = ts_node_child_by_field_name(func, TS_FIELD("property"));
+    if (ts_node_is_null(object) || ts_node_is_null(property)) {
+        return;
+    }
+    char *method = cbm_node_text(ctx->arena, property, ctx->source);
+    if (!method || strcmp(method, "get") != 0 ||
+        ts_node_named_child_count(args) < CHAN_SSE_ROUTE_ARGS ||
+        !js_sse_is_server_receiver(ctx, object)) {
+        return;
+    }
+    const char *path = sse_url_path(ctx->arena, extract_channel_name(ctx, args, consts));
+    if (!path || !sse_subtree_has_event_stream(ctx, call)) {
+        return;
+    }
+    push_channel(ctx, path, "sse", CBM_CHANNEL_EMIT, call);
+}
+
+/* ── SSE: Python ─────────────────────────────────────────────────── */
+
+static bool py_sse_is_route_method(const char *m) {
+    return m && (strcmp(m, "get") == 0 || strcmp(m, "post") == 0 || strcmp(m, "route") == 0 ||
+                 strcmp(m, "api_route") == 0);
+}
+
+/* @app.get("/stream") / @router.route("/stream") → "/stream". */
+static const char *py_sse_decorator_path(CBMExtractCtx *ctx, TSNode decorator,
+                                         const chan_const_table_t *consts) {
+    if (ts_node_named_child_count(decorator) == 0) {
+        return NULL;
+    }
+    TSNode expr = ts_node_named_child(decorator, 0);
+    if (strcmp(ts_node_type(expr), "call") != 0) {
+        return NULL;
+    }
+    TSNode func = ts_node_child_by_field_name(expr, TS_FIELD("function"));
+    if (ts_node_is_null(func) || strcmp(ts_node_type(func), "attribute") != 0) {
+        return NULL;
+    }
+    TSNode attr = ts_node_child_by_field_name(func, TS_FIELD("attribute"));
+    if (ts_node_is_null(attr)) {
+        return NULL;
+    }
+    char *method = cbm_node_text(ctx->arena, attr, ctx->source);
+    if (!py_sse_is_route_method(method)) {
+        return NULL;
+    }
+    TSNode args = ts_node_child_by_field_name(expr, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    return sse_url_path(ctx->arena, extract_channel_name(ctx, args, consts));
+}
+
+/* Walk outward to the nearest enclosing decorated function carrying a route
+ * decorator and return its path.  NULL when the handler is not routed. */
+static const char *py_sse_route_path(CBMExtractCtx *ctx, TSNode node,
+                                     const chan_const_table_t *consts) {
+    TSNode parent = ts_node_parent(node);
+    while (!ts_node_is_null(parent)) {
+        if (strcmp(ts_node_type(parent), "function_definition") == 0) {
+            TSNode deco = ts_node_parent(parent);
+            if (!ts_node_is_null(deco) &&
+                strcmp(ts_node_type(deco), "decorated_definition") == 0) {
+                uint32_t nc = ts_node_named_child_count(deco);
+                for (uint32_t i = 0; i < nc; i++) {
+                    TSNode child = ts_node_named_child(deco, i);
+                    if (strcmp(ts_node_type(child), "decorator") != 0) {
+                        continue;
+                    }
+                    const char *path = py_sse_decorator_path(ctx, child, consts);
+                    if (path) {
+                        return path;
+                    }
+                }
+            }
+        }
+        parent = ts_node_parent(parent);
+    }
+    return NULL;
+}
+
+/* True when a call carries media_type=/mimetype=/content_type="text/event-stream"
+ * (StreamingResponse, Flask Response, Django StreamingHttpResponse). */
+static bool py_sse_has_stream_kwarg(CBMExtractCtx *ctx, TSNode args) {
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (strcmp(ts_node_type(arg), "keyword_argument") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(arg, TS_FIELD("name"));
+        TSNode val = ts_node_child_by_field_name(arg, TS_FIELD("value"));
+        if (ts_node_is_null(key) || ts_node_is_null(val)) {
+            continue;
+        }
+        char *key_text = cbm_node_text(ctx->arena, key, ctx->source);
+        if (!key_text ||
+            (strcmp(key_text, "media_type") != 0 && strcmp(key_text, "mimetype") != 0 &&
+             strcmp(key_text, "content_type") != 0)) {
+            continue;
+        }
+        const char *value = literal_from_arg(ctx, val);
+        if (!value) {
+            value = literal_from_first_child(ctx, val);
+        }
+        if (value && sse_is_event_stream(value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Python SSE:
+ *   EventSourceResponse(…)                     (sse-starlette)          → emitter
+ *   StreamingResponse(…, media_type="text/event-stream")  and friends  → emitter
+ *   SSEClient("http://svc/events")             (sseclient/sseclient-py) → listener
+ * Emitters are keyed by the route path of the nearest enclosing decorated
+ * handler; without one, nothing is emitted. */
+static void py_sse_process_call(CBMExtractCtx *ctx, TSNode call,
+                                const chan_const_table_t *consts) {
+    TSNode func = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(func) || ts_node_is_null(args)) {
+        return;
+    }
+    char *callee = cbm_node_text(ctx->arena, func, ctx->source);
+    if (!callee) {
+        return;
+    }
+    const char *tail = callee;
+    const char *dot = strrchr(tail, '.');
+    if (dot) {
+        tail = dot + SKIP_ONE;
+    }
+
+    if (strcmp(tail, "SSEClient") == 0) {
+        const char *path = sse_url_path(ctx->arena, extract_channel_name(ctx, args, consts));
+        if (path) {
+            push_channel(ctx, path, "sse", CBM_CHANNEL_LISTEN, call);
+        }
+        return;
+    }
+
+    if (strcmp(tail, "EventSourceResponse") != 0 && !py_sse_has_stream_kwarg(ctx, args)) {
+        return;
+    }
+    const char *path = py_sse_route_path(ctx, call, consts);
+    if (path) {
+        push_channel(ctx, path, "sse", CBM_CHANNEL_EMIT, call);
+    }
+}
+
+/* ── SSE: Go ─────────────────────────────────────────────────────── */
+
+static bool go_sse_is_route_method(const char *m) {
+    return m && (strcmp(m, "HandleFunc") == 0 || strcmp(m, "Handle") == 0 ||
+                 strcmp(m, "GET") == 0 || strcmp(m, "Get") == 0);
+}
+
+/* Record a same-file route registration: HandleFunc("/path", handler) →
+ * handler name → path.  Reuses the const table shape (name → value). */
+static void go_sse_record_route(CBMExtractCtx *ctx, TSNode call, chan_const_table_t *routes) {
+    TSNode func = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(func) || strcmp(ts_node_type(func), "selector_expression") != 0) {
+        return;
+    }
+    TSNode field = ts_node_child_by_field_name(func, TS_FIELD("field"));
+    if (ts_node_is_null(field)) {
+        return;
+    }
+    char *method = cbm_node_text(ctx->arena, field, ctx->source);
+    if (!go_sse_is_route_method(method)) {
+        return;
+    }
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) < CHAN_SSE_ROUTE_ARGS) {
+        return;
+    }
+    const char *path = sse_url_path(ctx->arena, nth_arg_literal(ctx, args, 0));
+    if (!path) {
+        return;
+    }
+    TSNode handler = ts_node_named_child(args, SKIP_ONE);
+    const char *hk = ts_node_type(handler);
+    if (strcmp(hk, "identifier") != 0 && strcmp(hk, "selector_expression") != 0) {
+        return; /* inline closures are keyed via the ancestor walk instead */
+    }
+    char *handler_text = cbm_node_text(ctx->arena, handler, ctx->source);
+    if (!handler_text) {
+        return;
+    }
+    const char *tail = handler_text;
+    const char *dot = strrchr(tail, '.');
+    if (dot) {
+        tail = dot + SKIP_ONE;
+    }
+    /* NOTE: keyed by the bare handler name — two routers registering
+     * same-named handlers in one file would collide (first entry wins).
+     * Accepted as rare; see review follow-ups. */
+    routes->items[routes->count].name = tail;
+    routes->items[routes->count].value = path;
+    routes->count++;
+}
+
+static void go_sse_scan_routes(CBMExtractCtx *ctx, chan_const_table_t *routes) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->arena, ctx->root);
+
+    while (stack.count > 0 && routes->count < CHAN_CONST_CAP) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "call_expression") == 0) {
+            go_sse_record_route(ctx, node, routes);
+        }
+        ts_nstack_push_children(&stack, ctx->arena, node);
+    }
+}
+
+/* Path from an enclosing inline registration:
+ * http.HandleFunc("/events", func(w, r) { …header set here… }). */
+static const char *go_sse_ancestor_route_path(CBMExtractCtx *ctx, TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    while (!ts_node_is_null(parent)) {
+        if (strcmp(ts_node_type(parent), "call_expression") == 0) {
+            TSNode func = ts_node_child_by_field_name(parent, TS_FIELD("function"));
+            if (!ts_node_is_null(func) &&
+                strcmp(ts_node_type(func), "selector_expression") == 0) {
+                TSNode field = ts_node_child_by_field_name(func, TS_FIELD("field"));
+                char *method =
+                    ts_node_is_null(field) ? NULL : cbm_node_text(ctx->arena, field, ctx->source);
+                if (go_sse_is_route_method(method)) {
+                    TSNode args = ts_node_child_by_field_name(parent, TS_FIELD("arguments"));
+                    if (!ts_node_is_null(args)) {
+                        const char *path =
+                            sse_url_path(ctx->arena, nth_arg_literal(ctx, args, 0));
+                        if (path) {
+                            return path;
+                        }
+                    }
+                }
+            }
+        }
+        parent = ts_node_parent(parent);
+    }
+    return NULL;
+}
+
+/* Go SSE:
+ *   w.Header().Set("Content-Type", "text/event-stream")    → emitter
+ *   c.Header("Content-Type", "text/event-stream")   (gin)  → emitter
+ *   sse.NewClient("http://svc/events")       (r3labs/sse)  → listener
+ * Emitters are keyed by route path: an enclosing inline registration or the
+ * same-file HandleFunc table.  No path → no channel. */
+static void go_sse_process_call(CBMExtractCtx *ctx, TSNode call,
+                                const chan_const_table_t *routes) {
+    TSNode func = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(func) || strcmp(ts_node_type(func), "selector_expression") != 0) {
+        return;
+    }
+    TSNode field = ts_node_child_by_field_name(func, TS_FIELD("field"));
+    TSNode operand = ts_node_child_by_field_name(func, TS_FIELD("operand"));
+    if (ts_node_is_null(field) || ts_node_is_null(operand)) {
+        return;
+    }
+    char *method = cbm_node_text(ctx->arena, field, ctx->source);
+    if (!method) {
+        return;
+    }
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return;
+    }
+
+    /* r3labs/sse client: sse.NewClient("http://svc/events") */
+    if (strcmp(method, "NewClient") == 0) {
+        char *pkg = cbm_node_text(ctx->arena, operand, ctx->source);
+        if (!pkg || strcmp(pkg, "sse") != 0) {
+            return;
+        }
+        const char *path = sse_url_path(ctx->arena, nth_arg_literal(ctx, args, 0));
+        if (path) {
+            push_channel(ctx, path, "sse", CBM_CHANNEL_LISTEN, call);
+        }
+        return;
+    }
+
+    bool is_set = strcmp(method, "Set") == 0 || strcmp(method, "Add") == 0;
+    bool is_gin_header = strcmp(method, "Header") == 0;
+    if (!is_set && !is_gin_header) {
+        return;
+    }
+    const char *header = nth_arg_literal(ctx, args, 0);
+    const char *value = nth_arg_literal(ctx, args, SKIP_ONE);
+    if (!header || !value || !sse_is_event_stream(value) || !sse_ieq(header, "Content-Type")) {
+        return;
+    }
+    if (is_set) {
+        /* Require a header-map receiver: w.Header().Set / resp.Header.Set */
+        char *recv = cbm_node_text(ctx->arena, operand, ctx->source);
+        if (!recv || !strstr(recv, "Header")) {
+            return;
+        }
+    }
+
+    const char *path = go_sse_ancestor_route_path(ctx, call);
+    if (!path) {
+        const char *fn_name = enclosing_function_qn(ctx, call);
+        path = fn_name ? resolve_identifier(routes, fn_name) : NULL;
+    }
+    if (path) {
+        push_channel(ctx, path, "sse", CBM_CHANNEL_EMIT, call);
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -378,8 +876,12 @@ static void extract_channels_js(CBMExtractCtx *ctx) {
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
-        if (strcmp(ts_node_type(node), "call_expression") == 0) {
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "call_expression") == 0) {
             js_process_call(ctx, node, &consts);
+            js_sse_process_call(ctx, node, &consts);
+        } else if (strcmp(kind, "new_expression") == 0) {
+            js_sse_process_new(ctx, node, &consts);
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
@@ -557,6 +1059,7 @@ static void extract_channels_python(CBMExtractCtx *ctx) {
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "call") == 0) {
             py_process_call(ctx, node, &consts);
+            py_sse_process_call(ctx, node, &consts);
         } else if (strcmp(kind, "decorator") == 0) {
             py_process_decorator(ctx, node, &consts);
         }
@@ -626,6 +1129,9 @@ static void go_process_call(CBMExtractCtx *ctx, TSNode call) {
 }
 
 static void extract_channels_go(CBMExtractCtx *ctx) {
+    chan_const_table_t routes = {0};
+    go_sse_scan_routes(ctx, &routes);
+
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
     ts_nstack_push(&stack, ctx->arena, ctx->root);
@@ -634,6 +1140,7 @@ static void extract_channels_go(CBMExtractCtx *ctx) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call_expression") == 0) {
             go_process_call(ctx, node);
+            go_sse_process_call(ctx, node, &routes);
         }
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
@@ -875,27 +1382,13 @@ static void extract_channels_ruby(CBMExtractCtx *ctx) {
  *  Elixir — Phoenix.PubSub, Phoenix.Channel
  * ══════════════════════════════════════════════════════════════════ */
 
-/* Extract a string literal from the Nth named child of an args node. */
-static const char *elixir_nth_arg_literal(CBMExtractCtx *ctx, TSNode args, uint32_t index) {
-    uint32_t ac = ts_node_named_child_count(args);
-    if (ac <= index) {
-        return NULL;
-    }
-    TSNode arg = ts_node_named_child(args, index);
-    const char *val = literal_from_arg(ctx, arg);
-    if (!val) {
-        val = literal_from_first_child(ctx, arg);
-    }
-    return val;
-}
-
 /* Try to emit a channel from the second argument of an Elixir call. */
 static void elixir_emit_second_arg(CBMExtractCtx *ctx, TSNode call, TSNode args,
                                    const char *transport, CBMChannelDirection direction) {
     if (ts_node_is_null(args)) {
         return;
     }
-    const char *val = elixir_nth_arg_literal(ctx, args, SKIP_ONE);
+    const char *val = nth_arg_literal(ctx, args, SKIP_ONE);
     if (val) {
         push_channel(ctx, val, transport, direction, call);
     }

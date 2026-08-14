@@ -623,6 +623,7 @@ extern void suite_store_search(void);
 extern void suite_cypher(void);
 extern void suite_mcp(void);
 extern void suite_mcp_mutation_guard(void);
+extern void suite_cross_project_links(void);
 extern void suite_index_supervisor(void);
 extern void suite_daemon(void);
 extern void suite_project_lock(void);
@@ -865,6 +866,7 @@ int main(int argc, char **argv) {
     /* MCP Server (M9) */
     RUN_SELECTED_SUITE(mcp);
     RUN_SELECTED_SUITE(mcp_mutation_guard);
+    RUN_SELECTED_SUITE(cross_project_links);
     RUN_SELECTED_SUITE(index_supervisor);
 
     /* Shared MCP daemon coordination + private framing */

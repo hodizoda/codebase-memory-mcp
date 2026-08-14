@@ -537,6 +537,7 @@ TEST_CYPHER_SRCS = \
 
 TEST_MCP_SRCS = \
     tests/test_mcp.c \
+    tests/test_cross_project_links.c \
     tests/test_index_supervisor.c
 
 TEST_DAEMON_SRCS = \

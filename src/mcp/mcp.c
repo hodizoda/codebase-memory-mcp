@@ -691,6 +691,47 @@ static const tool_def_t TOOLS[] = {
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
      "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"cross_project_links", "Cross project links",
+     "List the cross-project communication links (CROSS_* edges) that cross-repo intelligence "
+     "discovered for one indexed project. Each link pairs a symbol in this project with its "
+     "counterpart in another indexed project over HTTP, async, channel, gRPC, GraphQL, or tRPC. "
+     "All protocols are visible from either participating project EXCEPT async: "
+     "CROSS_ASYNC_CALLS is recorded only on the calling project's side. "
+     "RESPONSE: 'total' plus a by_protocol breakdown header, then link rows grouped under a "
+     "shared 'PROTOCOL -> target_project' heading (rows: source source_file target target_file "
+     "via; source symbols live in THIS project, target symbols in target_project). "
+     "summary_only=true returns ONLY aggregates — per-protocol totals and per-project-pair "
+     "totals — the cheapest orientation call; start there on large graphs. "
+     "PAGINATION: rows are capped at limit (default 100, max 1000). The response always "
+     "includes 'total' and 'has_more'; page by re-calling with offset=offset+limit until "
+     "has_more is false. Narrow with protocol/target_project before paging. "
+     "EMPTY: links only exist after cross-repo indexing — if none are found, run "
+     "index_repository with mode \"cross-repo-intelligence\" and target_projects first. "
+     "format=\"json\" returns the SAME model as structured JSON.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
+     "\"Project whose cross-project links to list. HTTP/channel/gRPC/GraphQL/tRPC links are "
+     "stored in both participating projects' indexes, so either side works — but "
+     "CROSS_ASYNC_CALLS is written only into the CALLING project's index; query the caller "
+     "side for async links.\"},"
+     "\"protocol\":{\"type\":\"string\",\"enum\":[\"http\",\"async\",\"channel\",\"grpc\","
+     "\"graphql\",\"trpc\",\"CROSS_HTTP_CALLS\",\"CROSS_ASYNC_CALLS\",\"CROSS_CHANNEL\","
+     "\"CROSS_GRPC_CALLS\",\"CROSS_GRAPHQL_CALLS\",\"CROSS_TRPC_CALLS\"],\"description\":"
+     "\"Filter to one protocol. Short aliases map to the CROSS_* edge type.\"},"
+     "\"target_project\":{\"type\":\"string\",\"description\":\"Only links whose other side is "
+     "this project (matches the stored target_project of each link).\"},"
+     "\"summary_only\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Return only "
+     "aggregate counts (per-protocol and per-project-pair) with no link rows — token-cheap "
+     "orientation before paging.\"},"
+     "\"limit\":{\"type\":\"integer\",\"default\":100,\"minimum\":1,\"maximum\":1000,"
+     "\"description\":\"Max link rows per call. Response carries 'total' and 'has_more' so "
+     "callers can detect truncation and paginate.\"},"
+     "\"offset\":{\"type\":\"integer\",\"default\":0,\"description\":\"Skip the first N links. "
+     "Combine with 'limit' to page: increment offset by limit and re-call while has_more is "
+     "true.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\","
+     "\"description\":\"Response encoding. tree (default): grouped text rows. json: the SAME "
+     "model as structured JSON.\"}},\"required\":[\"project\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -721,6 +762,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
     {"ingest_traces", false, false, false, false},
+    {"cross_project_links", false, true, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
@@ -775,7 +817,7 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
         "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
-        "index_status",     "check_index_coverage", "detect_changes",
+        "index_status",     "check_index_coverage", "detect_changes", "cross_project_links",
     };
     static const char *const scout_tools[] = {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
@@ -11099,6 +11141,523 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── cross_project_links ──────────────────────────────────────── */
+
+/* The six CROSS_* edge types the cross-repo matcher writes. Mirrors the
+ * writer's list (delete_cross_edges in pipeline/pass_cross_repo.c) — keep the
+ * two in sync. Queries scope on this explicit list rather than a
+ * LIKE 'CROSS_%' prefix so a future edge type that merely shares the prefix
+ * never leaks into this tool unreviewed. */
+static const char *const XLINK_EDGE_TYPES[] = {
+    "CROSS_HTTP_CALLS", "CROSS_ASYNC_CALLS",   "CROSS_CHANNEL",
+    "CROSS_GRPC_CALLS", "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS",
+};
+
+enum {
+    XLINK_EDGE_TYPE_COUNT = sizeof(XLINK_EDGE_TYPES) / sizeof(XLINK_EDGE_TYPES[0]),
+    XLINK_DEFAULT_LIMIT = 100,
+    XLINK_MAX_LIMIT = 1000, /* hard page cap — a result set is never unbounded */
+    XLINK_PAIR_CAP = 20,    /* top project pairs shown in summary mode */
+    XLINK_SQL_AUTO_LEN = -1,
+};
+
+/* Accepts the exact CROSS_* edge type or its lowercase short alias. Returns
+ * the canonical edge type, or NULL when the value names no known protocol.
+ * Alias order matches XLINK_EDGE_TYPES. */
+static const char *xlink_normalize_protocol(const char *protocol) {
+    static const char *const aliases[] = {"http", "async", "channel", "grpc", "graphql", "trpc"};
+    for (int i = 0; i < XLINK_EDGE_TYPE_COUNT; i++) {
+        if (strcmp(protocol, XLINK_EDGE_TYPES[i]) == 0 || strcmp(protocol, aliases[i]) == 0) {
+            return XLINK_EDGE_TYPES[i];
+        }
+    }
+    return NULL;
+}
+
+/* Compose the shared WHERE clause over `edges e`. With a protocol filter the
+ * type predicate is `e.type = ?` alone — the value only ever comes from
+ * xlink_normalize_protocol, i.e. it IS a member of XLINK_EDGE_TYPES, so the
+ * IN-list would be redundant. Filters append plain '?' placeholders, so the
+ * bind order is fixed — project, then protocol (if set), then target_project
+ * (if set) — and xlink_bind_filters follows it. */
+static void xlink_build_where(char *buf, size_t bufsz, bool with_protocol, bool with_target) {
+    const char *target_pred =
+        with_target ? " AND json_extract(e.properties,'$.target_project') = ?" : "";
+    if (with_protocol) {
+        snprintf(buf, bufsz, "e.project = ? AND e.type = ?%s", target_pred);
+        return;
+    }
+    char in_list[CBM_SZ_256];
+    size_t pos = 0;
+    in_list[0] = '\0';
+    for (int i = 0; i < XLINK_EDGE_TYPE_COUNT; i++) {
+        int wrote = snprintf(in_list + pos, sizeof(in_list) - pos, "%s'%s'", i > 0 ? "," : "",
+                             XLINK_EDGE_TYPES[i]);
+        if (wrote < 0 || (size_t)wrote >= sizeof(in_list) - pos) {
+            break;
+        }
+        pos += (size_t)wrote;
+    }
+    snprintf(buf, bufsz, "e.project = ? AND e.type IN (%s)%s", in_list, target_pred);
+}
+
+/* Bind the filter params in xlink_build_where's placeholder order. Returns
+ * false when any bind fails — an unbound parameter compares as NULL and
+ * silently matches ZERO rows, which would surface as the "no links found"
+ * hint: exactly the false-empty failure mode this tool exists to eliminate.
+ * Callers must treat false as a query failure, never as an empty result. */
+static bool xlink_bind_filters(sqlite3_stmt *stmt, const char *project, const char *protocol,
+                               const char *target_project) {
+    int idx = 1;
+    if (sqlite3_bind_text(stmt, idx++, project, XLINK_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT) !=
+        SQLITE_OK) {
+        return false;
+    }
+    if (protocol && sqlite3_bind_text(stmt, idx++, protocol, XLINK_SQL_AUTO_LEN,
+                                      MCP_SQLITE_TRANSIENT) != SQLITE_OK) {
+        return false;
+    }
+    if (target_project && sqlite3_bind_text(stmt, idx++, target_project, XLINK_SQL_AUTO_LEN,
+                                            MCP_SQLITE_TRANSIENT) != SQLITE_OK) {
+        return false;
+    }
+    return true;
+}
+
+/* COUNT(*) over the filtered CROSS_* edge set. Returns -1 on SQL failure.
+ * Pure aggregate — never materializes rows, so summary_only stays cheap. */
+static int xlink_count(sqlite3 *db, const char *where, const char *project, const char *protocol,
+                       const char *target_project) {
+    char sql[CBM_SZ_1K];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM edges e WHERE %s", where);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, XLINK_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    if (!xlink_bind_filters(stmt, project, protocol, target_project)) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int total = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        total = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return total;
+}
+
+/* One collected aggregate row (by-protocol or project-pair breakdown). Both
+ * result sets are tiny (<= 6 protocols, pair rows capped at XLINK_PAIR_CAP)
+ * so collecting before emission keeps the tree/json emitters shared. */
+typedef struct {
+    char protocol[CBM_SZ_64];
+    char target_project[CBM_SZ_256];
+    int links;
+} xlink_agg_row_t;
+
+/* Per-protocol totals into rows[cap]; returns the row count or -1 on SQL
+ * failure. GROUP BY over the covered edge set only — no row materialization. */
+static int xlink_collect_protocols(sqlite3 *db, const char *where, const char *project,
+                                   const char *protocol, const char *target_project,
+                                   xlink_agg_row_t *rows, int cap) {
+    char sql[CBM_SZ_1K];
+    snprintf(sql, sizeof(sql),
+             "SELECT e.type, COUNT(*) FROM edges e WHERE %s "
+             "GROUP BY e.type ORDER BY COUNT(*) DESC, e.type",
+             where);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, XLINK_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    if (!xlink_bind_filters(stmt, project, protocol, target_project)) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int count = 0;
+    while (count < cap && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *type = (const char *)sqlite3_column_text(stmt, 0);
+        snprintf(rows[count].protocol, sizeof(rows[count].protocol), "%s", type ? type : "");
+        rows[count].target_project[0] = '\0';
+        rows[count].links = sqlite3_column_int(stmt, 1);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* Top (target_project, protocol) pair totals, largest first. Returns the row
+ * count or -1 on SQL failure. The pair's other member is always the selected
+ * project itself — links are stored per participating project. */
+static int xlink_collect_pairs(sqlite3 *db, const char *where, const char *project,
+                               const char *protocol, const char *target_project,
+                               xlink_agg_row_t *rows, int cap) {
+    char sql[CBM_SZ_1K];
+    snprintf(sql, sizeof(sql),
+             "SELECT coalesce(json_extract(e.properties,'$.target_project'),''), e.type, "
+             "COUNT(*) FROM edges e WHERE %s "
+             "GROUP BY 1, 2 ORDER BY 3 DESC, 1, 2 LIMIT %d",
+             where, cap);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, XLINK_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    if (!xlink_bind_filters(stmt, project, protocol, target_project)) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int count = 0;
+    while (count < cap && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *tp = (const char *)sqlite3_column_text(stmt, 0);
+        const char *type = (const char *)sqlite3_column_text(stmt, 1);
+        snprintf(rows[count].target_project, sizeof(rows[count].target_project), "%s",
+                 tp ? tp : "");
+        snprintf(rows[count].protocol, sizeof(rows[count].protocol), "%s", type ? type : "");
+        rows[count].links = sqlite3_column_int(stmt, 2);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* The zero-links message. A silent empty response is exactly how the previous
+ * incarnation of this tool masked two months of missing data — always say
+ * whether the graph has NO links at all (cross-repo indexing likely never
+ * ran) or the filters excluded everything. */
+static void xlink_zero_hint(char *buf, size_t bufsz, bool filtered, int base_total) {
+    if (filtered && base_total > 0) {
+        snprintf(buf, bufsz,
+                 "No cross-project links match the filters (the project has %d links in "
+                 "total). Loosen or drop protocol/target_project.",
+                 base_total);
+        return;
+    }
+    snprintf(buf, bufsz,
+             "No cross-project links found for this project. Cross-repo indexing may not "
+             "have been run: call index_repository with mode \"cross-repo-intelligence\" "
+             "and target_projects (e.g. [\"*\"]) after indexing the projects, then re-run "
+             "this tool. Note: async links are stored only on the calling project's side — "
+             "for async flows query the caller project.");
+}
+
+static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
+    /* Response encoding: tree tables by default; format:"json" emits the
+     * SAME model as structured JSON (cols + column-ordered row arrays). */
+    char *format_arg = cbm_mcp_get_string_arg(args, "format");
+    bool legacy_json = format_arg && strcmp(format_arg, "json") == 0;
+    free(format_arg);
+
+    char *protocol_arg = cbm_mcp_get_string_arg(args, "protocol");
+    const char *protocol = NULL;
+    if (protocol_arg && protocol_arg[0]) {
+        protocol = xlink_normalize_protocol(protocol_arg);
+        if (!protocol) {
+            free(protocol_arg);
+            free(project);
+            return cbm_mcp_text_result(
+                "protocol must be one of http, async, channel, grpc, graphql, trpc — or the "
+                "full CROSS_* edge type (e.g. CROSS_HTTP_CALLS)",
+                true);
+        }
+    }
+    char *target_arg = cbm_mcp_get_string_arg(args, "target_project");
+    const char *target_project = (target_arg && target_arg[0]) ? target_arg : NULL;
+    bool summary_only = cbm_mcp_get_bool_arg(args, "summary_only");
+    int limit = cbm_mcp_get_int_arg(args, "limit", XLINK_DEFAULT_LIMIT);
+    int offset = cbm_mcp_get_int_arg(args, "offset", 0);
+    if (limit < 1) {
+        limit = XLINK_DEFAULT_LIMIT;
+    }
+    if (limit > XLINK_MAX_LIMIT) {
+        limit = XLINK_MAX_LIMIT;
+    }
+    if (offset < 0) {
+        offset = 0;
+    }
+
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        free(protocol_arg);
+        free(target_arg);
+        free(project);
+        return cbm_mcp_text_result("project database unavailable", true);
+    }
+
+    char where[CBM_SZ_1K];
+    xlink_build_where(where, sizeof(where), protocol != NULL, target_project != NULL);
+
+    int total = xlink_count(db, where, project, protocol, target_project);
+    if (total < 0) {
+        free(protocol_arg);
+        free(target_arg);
+        free(project);
+        return cbm_mcp_text_result("failed to query cross-project links", true);
+    }
+
+    if (total == 0) {
+        bool filtered = protocol != NULL || target_project != NULL;
+        int base_total = 0;
+        if (filtered) {
+            char base_where[CBM_SZ_1K];
+            xlink_build_where(base_where, sizeof(base_where), false, false);
+            base_total = xlink_count(db, base_where, project, NULL, NULL);
+        }
+        char hint[CBM_SZ_512];
+        xlink_zero_hint(hint, sizeof(hint), filtered, base_total);
+        free(protocol_arg);
+        free(target_arg);
+        free(project);
+        if (legacy_json) {
+            yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+            yyjson_mut_val *root = yyjson_mut_obj(doc);
+            yyjson_mut_doc_set_root(doc, root);
+            yyjson_mut_obj_add_int(doc, root, "total", 0);
+            yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
+            char *json = yy_doc_to_str(doc);
+            yyjson_mut_doc_free(doc);
+            char *result = cbm_mcp_text_result(json, false);
+            free(json);
+            return result;
+        }
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_tree_scalar_int(&sb, "total", 0);
+        cbm_tree_scalar_str(&sb, "hint", hint);
+        char *text = cbm_sb_finish(&sb);
+        char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
+        free(text);
+        return result;
+    }
+
+    xlink_agg_row_t protocols[XLINK_EDGE_TYPE_COUNT];
+    int proto_count =
+        xlink_collect_protocols(db, where, project, protocol, target_project, protocols,
+                                XLINK_EDGE_TYPE_COUNT);
+    xlink_agg_row_t pairs[XLINK_PAIR_CAP];
+    int pair_count = summary_only ? xlink_collect_pairs(db, where, project, protocol,
+                                                        target_project, pairs, XLINK_PAIR_CAP)
+                                  : 0;
+    if (proto_count < 0 || pair_count < 0) {
+        free(protocol_arg);
+        free(target_arg);
+        free(project);
+        return cbm_mcp_text_result("failed to query cross-project links", true);
+    }
+
+    /* Paginated link rows. LEFT JOIN so a dangling source_id can never make
+     * the page disagree with 'total'. The ORDER BY ends on e.id — a unique
+     * column — so the ordering is total and offset pages are contractually
+     * stable across calls: every row is returned exactly once. The 'via'
+     * column carries the protocol identifier (url path, channel name, or
+     * service/operation/procedure — the matcher stores all three under
+     * url_path). */
+    sqlite3_stmt *rows_stmt = NULL;
+    if (!summary_only) {
+        char sql[CBM_SZ_2K];
+        snprintf(sql, sizeof(sql),
+                 "SELECT e.type, coalesce(n.qualified_name,''), coalesce(n.file_path,''), "
+                 "coalesce(json_extract(e.properties,'$.target_project'),''), "
+                 "coalesce(json_extract(e.properties,'$.target_function'),''), "
+                 "coalesce(json_extract(e.properties,'$.target_file'),''), "
+                 "coalesce(json_extract(e.properties,'$.url_path'),"
+                 "json_extract(e.properties,'$.channel_name'),'') "
+                 "FROM edges e LEFT JOIN nodes n ON n.id = e.source_id "
+                 "WHERE %s "
+                 "ORDER BY e.type, json_extract(e.properties,'$.target_project'), e.id "
+                 "LIMIT ? OFFSET ?",
+                 where);
+        if (sqlite3_prepare_v2(db, sql, XLINK_SQL_AUTO_LEN, &rows_stmt, NULL) != SQLITE_OK) {
+            free(protocol_arg);
+            free(target_arg);
+            free(project);
+            return cbm_mcp_text_result("failed to query cross-project links", true);
+        }
+        int idx = 1 + 1 /* project */ + (protocol ? 1 : 0) + (target_project ? 1 : 0);
+        if (!xlink_bind_filters(rows_stmt, project, protocol, target_project) ||
+            sqlite3_bind_int(rows_stmt, idx, limit) != SQLITE_OK ||
+            sqlite3_bind_int(rows_stmt, idx + 1, offset) != SQLITE_OK) {
+            sqlite3_finalize(rows_stmt);
+            free(protocol_arg);
+            free(target_arg);
+            free(project);
+            return cbm_mcp_text_result("failed to query cross-project links", true);
+        }
+    }
+
+    static const char *const proto_cols[] = {"protocol", "links"};
+    static const char *const pair_cols[] = {"target_project", "protocol", "links"};
+
+    if (legacy_json) {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_int(doc, root, "total", total);
+
+        yyjson_mut_val *bp = yyjson_mut_obj(doc);
+        yyjson_mut_val *bp_cols = yyjson_mut_arr(doc);
+        yyjson_mut_arr_add_str(doc, bp_cols, proto_cols[0]);
+        yyjson_mut_arr_add_str(doc, bp_cols, proto_cols[1]);
+        yyjson_mut_obj_add_val(doc, bp, "cols", bp_cols);
+        yyjson_mut_val *bp_rows = yyjson_mut_arr(doc);
+        for (int i = 0; i < proto_count; i++) {
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            yyjson_mut_arr_add_strcpy(doc, row, protocols[i].protocol);
+            yyjson_mut_arr_add_int(doc, row, protocols[i].links);
+            yyjson_mut_arr_add_val(bp_rows, row);
+        }
+        yyjson_mut_obj_add_val(doc, bp, "rows", bp_rows);
+        yyjson_mut_obj_add_val(doc, root, "by_protocol", bp);
+
+        if (summary_only) {
+            yyjson_mut_val *pp = yyjson_mut_obj(doc);
+            yyjson_mut_val *pp_cols = yyjson_mut_arr(doc);
+            for (size_t c = 0; c < sizeof(pair_cols) / sizeof(pair_cols[0]); c++) {
+                yyjson_mut_arr_add_str(doc, pp_cols, pair_cols[c]);
+            }
+            yyjson_mut_obj_add_val(doc, pp, "cols", pp_cols);
+            yyjson_mut_val *pp_rows = yyjson_mut_arr(doc);
+            for (int i = 0; i < pair_count; i++) {
+                yyjson_mut_val *row = yyjson_mut_arr(doc);
+                yyjson_mut_arr_add_strcpy(doc, row, pairs[i].target_project);
+                yyjson_mut_arr_add_strcpy(doc, row, pairs[i].protocol);
+                yyjson_mut_arr_add_int(doc, row, pairs[i].links);
+                yyjson_mut_arr_add_val(pp_rows, row);
+            }
+            yyjson_mut_obj_add_val(doc, pp, "rows", pp_rows);
+            yyjson_mut_obj_add_val(doc, root, "project_pairs", pp);
+            yyjson_mut_obj_add_str(doc, root, "hint",
+                                   "summary_only — re-call without summary_only (narrowing "
+                                   "with protocol/target_project) to page the link rows");
+        } else {
+            yyjson_mut_val *lk = yyjson_mut_obj(doc);
+            yyjson_mut_val *lk_cols = yyjson_mut_arr(doc);
+            static const char *const link_cols[] = {"protocol",       "source", "source_file",
+                                                    "target_project", "target", "target_file",
+                                                    "via"};
+            for (size_t c = 0; c < sizeof(link_cols) / sizeof(link_cols[0]); c++) {
+                yyjson_mut_arr_add_str(doc, lk_cols, link_cols[c]);
+            }
+            yyjson_mut_obj_add_val(doc, lk, "cols", lk_cols);
+            yyjson_mut_val *lk_rows = yyjson_mut_arr(doc);
+            int emitted = 0;
+            while (sqlite3_step(rows_stmt) == SQLITE_ROW) {
+                yyjson_mut_val *row = yyjson_mut_arr(doc);
+                for (int c = 0; c < 7; c++) {
+                    const char *v = (const char *)sqlite3_column_text(rows_stmt, c);
+                    yyjson_mut_arr_add_strcpy(doc, row, v ? v : "");
+                }
+                yyjson_mut_arr_add_val(lk_rows, row);
+                emitted++;
+            }
+            yyjson_mut_obj_add_val(doc, lk, "rows", lk_rows);
+            yyjson_mut_obj_add_val(doc, root, "links", lk);
+            yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emitted);
+        }
+        if (rows_stmt) {
+            sqlite3_finalize(rows_stmt);
+        }
+        free(protocol_arg);
+        free(target_arg);
+        free(project);
+        char *json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+        char *result = cbm_mcp_text_result(json, false);
+        free(json);
+        return result;
+    }
+
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    cbm_tree_scalar_int(&sb, "total", total);
+    cbm_tree_table_header(&sb, "by_protocol", proto_count, proto_cols, 2);
+    for (int i = 0; i < proto_count; i++) {
+        cbm_tree_row_begin(&sb);
+        cbm_tree_cell_str(&sb, protocols[i].protocol, true);
+        cbm_tree_cell_int(&sb, protocols[i].links, false);
+        cbm_tree_row_end(&sb);
+    }
+
+    if (summary_only) {
+        cbm_tree_table_header(&sb, "project_pairs", pair_count, pair_cols, 3);
+        for (int i = 0; i < pair_count; i++) {
+            cbm_tree_row_begin(&sb);
+            cbm_tree_cell_str(&sb, pairs[i].target_project, true);
+            cbm_tree_cell_str(&sb, pairs[i].protocol, false);
+            cbm_tree_cell_int(&sb, pairs[i].links, false);
+            cbm_tree_row_end(&sb);
+        }
+        if (pair_count == XLINK_PAIR_CAP) {
+            cbm_tree_scalar_str(&sb, "note", "top pairs only — narrow with target_project "
+                                             "for the rest");
+        }
+        cbm_tree_scalar_str(&sb, "hint",
+                            "summary_only — re-call without summary_only (narrowing with "
+                            "protocol/target_project) to page the link rows");
+    } else {
+        /* Grouped tree rows: the shared (protocol, target_project) pair is
+         * printed ONCE per group; the SQL ordering already clusters them. */
+        char buf[CBM_SZ_512];
+        int emitted = 0;
+        cbm_sb_t rows;
+        cbm_sb_init(&rows);
+        char cur_group[CBM_SZ_512] = "";
+        while (sqlite3_step(rows_stmt) == SQLITE_ROW) {
+            const char *type = (const char *)sqlite3_column_text(rows_stmt, 0);
+            const char *src_qn = (const char *)sqlite3_column_text(rows_stmt, 1);
+            const char *src_file = (const char *)sqlite3_column_text(rows_stmt, 2);
+            const char *tp = (const char *)sqlite3_column_text(rows_stmt, 3);
+            const char *tgt_fn = (const char *)sqlite3_column_text(rows_stmt, 4);
+            const char *tgt_file = (const char *)sqlite3_column_text(rows_stmt, 5);
+            const char *via = (const char *)sqlite3_column_text(rows_stmt, 6);
+            char group[CBM_SZ_512];
+            snprintf(group, sizeof(group), "%s -> %s", type ? type : "",
+                     (tp && tp[0]) ? tp : "(unknown)");
+            if (strcmp(group, cur_group) != 0) {
+                snprintf(cur_group, sizeof(cur_group), "%s", group);
+                cbm_sb_append(&rows, group);
+                cbm_sb_append(&rows, ":\n");
+            }
+            cbm_tree_row_begin(&rows);
+            cbm_tree_cell_str(&rows, src_qn, true);
+            cbm_tree_cell_str(&rows, src_file, false);
+            cbm_tree_cell_str(&rows, tgt_fn, false);
+            cbm_tree_cell_str(&rows, tgt_file, false);
+            cbm_tree_cell_str(&rows, via, false);
+            cbm_tree_row_end(&rows);
+            emitted++;
+        }
+        snprintf(buf, sizeof(buf),
+                 "links: %d  (rows: source source_file target target_file via; group = "
+                 "protocol -> target_project; source symbols are in this project)\n",
+                 emitted);
+        cbm_sb_append(&sb, buf);
+        char *rows_text = cbm_sb_finish(&rows);
+        cbm_sb_append(&sb, rows_text ? rows_text : "");
+        free(rows_text);
+        cbm_tree_scalar_bool(&sb, "has_more", total > offset + emitted);
+    }
+
+    if (rows_stmt) {
+        sqlite3_finalize(rows_stmt);
+    }
+    free(protocol_arg);
+    free(target_arg);
+    free(project);
+    char *text = cbm_sb_finish(&sb);
+    char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
+    free(text);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -11158,6 +11717,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "cross_project_links") == 0) {
+        return handle_cross_project_links(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);

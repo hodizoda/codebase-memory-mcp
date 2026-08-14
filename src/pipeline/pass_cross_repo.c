@@ -638,6 +638,13 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         char route_qn[CR_QN_BUF];
         char cpath[CBM_SZ_256];
         const char *curl = cbm_route_canon_path(cr_url_path(url_path), cpath, sizeof(cpath));
+        /* Route QNs never carry a query string, so a client URL like
+         * "/api/orders?page=1" would never match the "/api/orders" handler.
+         * Strip it here so query-carrying client calls rendezvous normally. */
+        char *qmark = strchr(cpath, '?');
+        if (curl == cpath && qmark && qmark != cpath) {
+            *qmark = '\0';
+        }
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
 
         char handler_name[CBM_SZ_256] = {0};

@@ -882,6 +882,51 @@ TEST(es_tests_crossfile_python) {
     PASS();
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ * FAMILY 10: HANDLES for inline route handlers
+ *
+ * app.get(path, (req, res) => {...}) passes the handler as an anonymous
+ * function expression, so there is no name to resolve and — before the
+ * fallback in pass_calls.c / pass_parallel.c — no HANDLES edge was emitted
+ * at all.  find_route_handler() in pass_cross_repo.c treats a Route with no
+ * HANDLES as unresolvable, so cross-repo matching silently discarded the
+ * link even after route, path and method matched.  Measured on a two-project
+ * fixture: anonymous handlers gave 0 cross_http_calls, named handlers 2.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Inline arrow handler must still produce a HANDLES edge. */
+TEST(es_handles_inline_arrow_handler) {
+    static const ES_LangFile f[] = {
+        {"server.js", "const express = require('express');\nconst app = express();\n\n"
+                      "app.get('/api/orders', (req, res) => {\n"
+                      "  res.json({ orders: [] });\n});\n\n"
+                      "app.listen(3000);\n"}};
+    ASSERT_TRUE(es_edge_present(f, 1, "HANDLES", 1));
+    PASS();
+}
+
+/* The fallback attributes the route to the registering module, which is where
+ * an inline handler body actually lives. */
+TEST(es_handles_inline_arrow_attributes_to_module) {
+    static const ES_LangFile f[] = {
+        {"server.js", "const express = require('express');\nconst app = express();\n\n"
+                      "app.get('/api/orders', (req, res) => {\n"
+                      "  res.json({ orders: [] });\n});\n"}};
+    ASSERT_TRUE(es_exact_edge_by_name(f, 1, "HANDLES", "server.js", "/api/orders"));
+    PASS();
+}
+
+/* The fallback must NOT hijack a resolvable named handler: HANDLES still comes
+ * from the function, not the module. */
+TEST(es_handles_named_handler_still_attributes_to_function) {
+    static const ES_LangFile f[] = {
+        {"server.js", "const express = require('express');\nconst app = express();\n\n"
+                      "function listOrders(req, res) {\n  res.json({ orders: [] });\n}\n\n"
+                      "app.get('/api/orders', listOrders);\n"}};
+    ASSERT_TRUE(es_exact_edge_by_name(f, 1, "HANDLES", "listOrders", "/api/orders"));
+    PASS();
+}
+
 /* TypeScript TESTS cross-file: service.test.ts tests service.ts. */
 TEST(es_tests_crossfile_typescript) {
     static const ES_LangFile f[] = {
@@ -963,4 +1008,11 @@ SUITE(edge_structural) {
     /* Expected GREEN: Python + TypeScript test file conventions. */
     RUN_TEST(es_tests_crossfile_python);
     RUN_TEST(es_tests_crossfile_typescript);
+
+    /* ── FAMILY 10: HANDLES for inline route handlers ────────── */
+    /* Regression: anonymous handlers emitted no HANDLES, which made
+     * cross-repo matching return 0 edges for the dominant express idiom. */
+    RUN_TEST(es_handles_inline_arrow_handler);
+    RUN_TEST(es_handles_inline_arrow_attributes_to_module);
+    RUN_TEST(es_handles_named_handler_still_attributes_to_function);
 }

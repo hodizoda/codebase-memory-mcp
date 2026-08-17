@@ -1719,20 +1719,26 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
+
+    /* Parallel-pipeline twin of handle_route_registration() in pass_calls.c —
+     * keep the fallback in both. An inline handler expression has no name to
+     * resolve, so without this a Route ends up with no HANDLES edge at all and
+     * cross-repo matching drops the link despite a successful route match. */
+    const cbm_gbuf_node_t *h = NULL;
     if (handler_ref && handler_ref[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(registry, handler_ref, module_qn, ik, iv, ic);
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
-            const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
-            if (h) {
-                char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                       closing brace */
-                char esc_h2[CBM_SZ_512];
-                cbm_json_escape(esc_h2, sizeof(esc_h2), hres.qualified_name);
-                snprintf(hp, sizeof(hp), "{\"handler\":\"%s\"}", esc_h2);
-                cbm_gbuf_insert_edge(gbuf, h->id, rid, "HANDLES", hp);
-            }
+            h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
         }
     }
+    const char *hqn = h != NULL ? h->qualified_name : source->qualified_name;
+    char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
+                           closing brace */
+    char esc_h2[CBM_SZ_512];
+    cbm_json_escape(esc_h2, sizeof(esc_h2), hqn != NULL ? hqn : "");
+    snprintf(hp, sizeof(hp), "{\"handler\":\"%s\"%s}", esc_h2,
+             h != NULL ? "" : ",\"via\":\"inline_handler\"");
+    cbm_gbuf_insert_edge(gbuf, h != NULL ? h->id : source->id, rid, "HANDLES", hp);
 }
 
 /* Reject regex metacharacters, spaces, double-slashes in URL candidates. */

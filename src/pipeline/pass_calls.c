@@ -216,21 +216,33 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
+
+    /* Resolve the handler when it is passed by name. An inline function
+     * expression — app.get(path, (req,res) => {...}), the dominant express /
+     * FastAPI / Fiber idiom — has no name to resolve, and a named handler
+     * imported from elsewhere may be absent from this buffer. In both cases
+     * fall back to the registering node, which is where the handler body
+     * actually lives. Emitting SOME HANDLES edge is what matters:
+     * find_route_handler() in pass_cross_repo.c treats a Route with no
+     * HANDLES as unresolvable, so cross-repo matching silently discards the
+     * link even after the route, path and method all matched. */
+    const cbm_gbuf_node_t *handler = NULL;
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
                                                      module_qn, imp_keys, imp_vals, imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
-            const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
-            if (handler != NULL) {
-                char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                           closing brace */
-                char esc_h[CBM_SZ_512];
-                cbm_json_escape(esc_h, sizeof(esc_h), hres.qualified_name);
-                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
-                cbm_gbuf_insert_edge(ctx->gbuf, handler->id, route_id, "HANDLES", hprops);
-            }
+            handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
         }
     }
+    const char *hqn = handler != NULL ? handler->qualified_name : source_node->qualified_name;
+    char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
+                               closing brace */
+    char esc_h[CBM_SZ_512];
+    cbm_json_escape(esc_h, sizeof(esc_h), hqn != NULL ? hqn : "");
+    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"%s}", esc_h,
+             handler != NULL ? "" : ",\"via\":\"inline_handler\"");
+    cbm_gbuf_insert_edge(ctx->gbuf, handler != NULL ? handler->id : source_node->id, route_id,
+                         "HANDLES", hprops);
 }
 
 /* Emit an HTTP/async route edge for a service call. */

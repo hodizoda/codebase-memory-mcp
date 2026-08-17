@@ -3269,7 +3269,7 @@ TEST(cypher_issue1111_with_type_count_group) {
     PASS();
 }
 
-/* #1111 follow-up (review from DeusData on #1221): with_agg_find_or_create's
+/* #1111 follow-up (review from hodizoda on #1221): with_agg_find_or_create's
  * bare-node-carry check only tested `!property && variable`, so an entity-
  * introspection alias like `labels(f) AS l` (variable set, property NULL, func
  * set) was ALSO tagged with the source node's id. A later `l.file_path` then

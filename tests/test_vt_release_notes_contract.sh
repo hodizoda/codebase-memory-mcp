@@ -182,7 +182,7 @@ run_notes() {
   (cd "$FIX" &&
     PATH="$FIX/bin:$PATH" \
       GH_TOKEN=stub VERSION=v1.0.0 \
-      GITHUB_REPOSITORY=DeusData/codebase-memory-mcp \
+      GITHUB_REPOSITORY=hodizoda/codebase-memory-mcp \
       VT_CANDIDATES=evidence/release-candidates.tsv \
       VT_RESULTS_PATH=evidence/virustotal-candidate-results.tsv \
       RELEASE_SELECTION=evidence/release-selection.tsv \

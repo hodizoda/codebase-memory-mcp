@@ -656,7 +656,7 @@ static bool runtime_test_mac_ad_hoc_sign(const char *path) {
     pid_t child = fork();
     if (child == 0) {
         execl("/usr/bin/codesign", "codesign", "--force", "--sign", "-", "--timestamp=none",
-              "--identifier", "org.deusdata.cbm.foreign-test", path, (char *)NULL);
+              "--identifier", "org.hodizoda.cbm.foreign-test", path, (char *)NULL);
         _exit(127);
     }
     int status = 0;

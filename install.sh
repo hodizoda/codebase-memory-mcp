@@ -4,7 +4,7 @@ set -euo pipefail
 # install.sh — One-line installer for codebase-memory-mcp.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/hodizoda/codebase-memory-mcp/main/install.sh | bash
 #   curl -fsSL ... | bash -s -- --dir /path   # Custom install directory
 #
 # Environment:
@@ -16,7 +16,7 @@ set -euo pipefail
 # called because the final line hasn't arrived yet.
 main() {
 
-REPO="DeusData/codebase-memory-mcp"
+REPO="hodizoda/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 SKIP_CONFIG=false
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"

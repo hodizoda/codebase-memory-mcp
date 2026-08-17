@@ -1,13 +1,13 @@
-PackageIdentifier: DeusData.CodebaseMemoryMcp
+PackageIdentifier: hodizoda.CodebaseMemoryMcp
 PackageVersion: 0.8.1
 PackageLocale: en-US
-Publisher: DeusData
-PublisherUrl: https://github.com/DeusData
-PublisherSupportUrl: https://github.com/DeusData/codebase-memory-mcp/issues
+Publisher: hodizoda
+PublisherUrl: https://github.com/hodizoda
+PublisherSupportUrl: https://github.com/hodizoda/codebase-memory-mcp/issues
 PackageName: codebase-memory-mcp
-PackageUrl: https://github.com/DeusData/codebase-memory-mcp
+PackageUrl: https://github.com/hodizoda/codebase-memory-mcp
 License: MIT
-LicenseUrl: https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE
+LicenseUrl: https://github.com/hodizoda/codebase-memory-mcp/blob/main/LICENSE
 ShortDescription: Fast code intelligence engine for AI coding agents
 Description: |-
   codebase-memory-mcp is a native MCP server distributed as a verified runtime
@@ -26,6 +26,6 @@ Tags:
   - codebase
   - developer-tools
   - tree-sitter
-ReleaseNotesUrl: https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.8.1
+ReleaseNotesUrl: https://github.com/hodizoda/codebase-memory-mcp/releases/tag/v0.8.1
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0

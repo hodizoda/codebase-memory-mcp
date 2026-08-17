@@ -294,9 +294,9 @@ build_mcpb_bundle() {
   "display_name": "Codebase Memory",
   "version": "$mcpb_version",
   "description": "Codebase knowledge graph for AI agents — 159 languages, sub-ms queries, 99% fewer tokens.",
-  "author": { "name": "DeusData", "url": "https://github.com/DeusData" },
-  "repository": { "type": "git", "url": "https://github.com/DeusData/codebase-memory-mcp" },
-  "homepage": "https://deusdata.github.io/codebase-memory-mcp/",
+  "author": { "name": "hodizoda", "url": "https://github.com/hodizoda" },
+  "repository": { "type": "git", "url": "https://github.com/hodizoda/codebase-memory-mcp" },
+  "homepage": "https://hodizoda.github.io/codebase-memory-mcp/",
   "license": "MIT",
   "server": {
     "type": "binary",

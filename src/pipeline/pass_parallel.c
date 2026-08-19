@@ -100,6 +100,10 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include <string.h>
 #include <time.h>
 
+/* internal/cbm/service_patterns.c — not declared in service_patterns.h; same
+ * local-prototype idiom as pass_route_nodes.c. */
+bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
+
 /* Back-pressure nap-cycle counter (test observability): each execution of the
  * over-budget collect+nap gate counts one cycle. Lets tests assert the gate does
  * not re-pay the full nap tax on every file pull when napping cannot reclaim
@@ -1796,12 +1800,30 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                const CBMCall *call) {
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
-        const char *url = ca->value ? ca->value : ca->expr;
+        /* Kind gate: ca->value is set ONLY for string-like node kinds and
+         * resolved constants (extract_call_args), while ca->expr is raw source
+         * text surviving for EVERY node kind — including JS regex literals
+         * (/%s/g, /~0/g), which begin with '/' just like a path and flooded
+         * real fleets with garbage Routes. Template literals are the one
+         * URL-bearing kind is_string_like() excludes (value stays NULL), so
+         * allow expr only when it starts with a backtick; a regex literal
+         * never does. */
+        const char *url = ca->value;
+        if (!url && ca->expr && ca->expr[0] == '`') {
+            url = ca->expr;
+        }
         if (!url || (url[0] != '/' && url[0] != '`')) {
             continue;
         }
         char norm[CBM_SZ_256];
         if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
+            continue;
+        }
+        /* Route-literal validation (same validator as the has_url gate in
+         * emit_service_edge and pass_calls.c's emit_http_async_edge): rejects
+         * filesystem paths (/tmp/heartbeat), non-http schemes, and
+         * split/join-style callees that string literals can still smuggle in. */
+        if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
         char route_qn[CBM_ROUTE_QN_SIZE];
@@ -2040,7 +2062,12 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         /* No path found — fall through to normal CALLS edge */
     }
 
-    bool has_url = (arg && arg[0] != '\0' && (arg[0] == '/' || strstr(arg, "://") != NULL));
+    /* Route-literal validation (twin of emit_http_async_edge's is_url in
+     * pass_calls.c — keep both): a leading '/' alone also matches filesystem
+     * paths ("/tmp/heartbeat") and non-http schemes; the shared validator
+     * rejects those plus split/join-style callees. */
+    bool has_url = (arg && arg[0] != '\0' && (arg[0] == '/' || strstr(arg, "://") != NULL) &&
+                    cbm_service_pattern_is_http_route_literal(arg, call->callee_name));
     bool has_topic = (arg && arg[0] != '\0' && svc == CBM_SVC_ASYNC && strlen(arg) > PP_ESC_SPACE);
 
     if ((svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) && (has_url || has_topic)) {
@@ -2057,7 +2084,13 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call);
+    /* HTTP clients only. This ran unconditionally for every resolved call —
+     * str.replace(/~0/g,...), os.Stat("/tmp/..."), anything with a
+     * slash-leading arg — and its via=arg_url edges were the dominant
+     * producer of false cross-repo HTTP links on a real 32-repo fleet. */
+    if (svc == CBM_SVC_HTTP) {
+        detect_url_in_args(gbuf, source, call);
+    }
 }
 
 /* Find the source node for an edge: enclosing function or file node. */
@@ -2500,9 +2533,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
                                             .confidence = PP_HALF_CONF,
                                             .strategy = "service_pattern"};
-                emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
-                                  module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
+                /* target=NULL, exactly like the sequential twin (pass_calls.c)
+                 * and the #523 external-client site below: when the route-
+                 * literal validator rejects the arg inside emit_service_edge,
+                 * the fall-through must emit nothing — a source target here
+                 * would fabricate a CALLS self-edge instead. */
+                emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &svc_res, module_qn,
+                                  rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
+                                  false);
                 continue;
             }
         }
@@ -2522,7 +2560,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                  * from res->qualified_name via cbm_service_pattern_match, which
                  * "fetch" deliberately never matches (mirrors pass_calls.c). */
                 const char *u = call->first_string_arg;
-                if (u && u[0] != '\0' && (u[0] == '/' || strstr(u, "://") != NULL)) {
+                /* Validate here too: this fallback calls the low-level emitter
+                 * directly, skipping emit_service_edge's has_url gate. The
+                 * sequential twin funnels fetch through emit_http_async_edge,
+                 * whose is_url carries the same validator — without it here,
+                 * fetch("/tmp/x.json") emits in parallel but not sequential. */
+                if (u && u[0] != '\0' && (u[0] == '/' || strstr(u, "://") != NULL) &&
+                    cbm_service_pattern_is_http_route_literal(u, call->callee_name)) {
                     cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                                  .confidence = PP_HALF_CONF,
                                                  .strategy = "service_pattern"};

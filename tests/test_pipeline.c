@@ -4372,7 +4372,7 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
  * pass_parallel.c's resolve_file_calls). The guard must not drop a weak member
  * match before the service classification runs — it suppresses ONLY the plain
  * CALLS fall-through, so every service edge (HTTP_CALLS via the #523 callee
- * bypass or emit_service_edge's unconditional detect_url_in_args, Route via the
+ * bypass or emit_service_edge's HTTP-gated detect_url_in_args, Route via the
  * ROUTE_REG fall-through, …) is emitted exactly as on main. These callees are
  * classified by main's verb-suffix + URL-arg heuristic, NOT by an HTTP library
  * name in the callee — a duplicated predicate keyed on the resolved QN lost them
@@ -4425,11 +4425,11 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
                     "  return request(app).get('/y');\n"
                     "}\n");
     /* `dev.load('/data')`: `.load` is NOT a route suffix and `dev` is not an HTTP
-     * lib, so main classifies it via the unconditional detect_url_in_args (URL
-     * arg) -> HTTP_CALLS, while the weak plain match to ApiThing.load is the false
-     * edge that must be suppressed. This is exactly the detect_url_in_args path
-     * the previous (predicate-duplicating) guard skipped by dropping the call
-     * before emit_service_edge ran — the class of ~399 HTTP_CALLS it lost. */
+     * lib, so no service classification applies — since detect_url_in_args became
+     * HTTP-gated (a slash-leading arg on a non-HTTP callee is a filesystem path or
+     * regex far more often than an API call), this must yield NO HTTP_CALLS edge,
+     * and the weak plain match to ApiThing.load stays suppressed. Both false
+     * edges gone; the call leaves no trace. */
     write_temp_file(tmp, "src/load.ts",
                     "export function callLoad(dev: unknown): unknown {\n"
                     "  return dev.load('/api/data');\n"
@@ -4470,16 +4470,17 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
 
-    /* (1) Genuine HTTP_CALLS survive under the guard (>= 3):
-     *   - axios.get('/api/orders') -> 2 edges (recognized lib #523 callee bypass
-     *     + detect_url_in_args), and
-     *   - dev.load('/api/data')    -> 1 edge via detect_url_in_args, which runs
-     *     unconditionally after emit_service_edge's branch even when the plain
-     *     fall-through is suppressed.
-     * dev.load is the class the predicate-duplicating guard lost: `.load` is not
-     * a route suffix and `dev` is not an HTTP lib, so it was dropped before
-     * emit_service_edge ran (RED on that guard: only axios's 2). */
-    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 3);
+    /* (1) Genuine HTTP_CALLS survive under the guard — exactly axios's 2
+     * (recognized lib #523 callee bypass + detect_url_in_args, which still runs
+     * for HTTP-classified callees even when the plain fall-through is
+     * suppressed). dev.load('/api/data') contributes NOTHING anymore:
+     * detect_url_in_args is HTTP-gated, so a slash-leading arg on a non-HTTP
+     * callee no longer mints an arg_url edge (that pattern flooded real fleets
+     * with /tmp/... paths and regex literals as URLs). EQ, not GTE: a stray
+     * third edge here means the gate regressed. */
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 2);
+    /* dev.load's former arg_url Route must no longer be minted. */
+    ASSERT_EQ(count_nodes_named(s, project, "/api/data"), 0);
     /* (2) The verb-suffix + route-path member calls keep their route
      * registrations (edge type CALLS -> a Route node named by the path). These
      * classify as route_registration on main, NOT HTTP_CALLS — Option A preserves
@@ -4811,6 +4812,193 @@ TEST(pipeline_local_fetch_shadow_not_classified_as_http) {
 
     ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 0);
     ASSERT_TRUE(cross_file_call_exists(s, project, "useLocalFetch", "fetch"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* URL-argument extraction, parallel path (>= 50 files -> pass_parallel.c). On a
+ * real 32-repo fleet, detect_url_in_args accepted JS regex literals (/~0/g from
+ * a minified swagger-ui bundle) and filesystem paths (/tmp/heartbeat) as URLs —
+ * via=arg_url edges then dominated the false cross-repo HTTP links. Three
+ * layered guards are pinned here:
+ *   (1) kind gate — a regex literal has no ca->value (not is_string_like) and
+ *       its raw expr starts with '/', not '`', so it can never reach the URL
+ *       logic; template literals (backtick expr) still can,
+ *   (2) svc gate — detect_url_in_args runs only for HTTP-classified callees,
+ *   (3) route-literal validator — /tmp/... rejected on the has_url path, the
+ *       arg_url path, and the native-fetch fallback (which skips both gates).
+ * Genuine relative, absolute, and template-literal HTTP calls must survive:
+ * the exact-count assert catches both garbage edges and over-rejection. */
+TEST(pipeline_parallel_url_arg_regex_and_fs_paths_rejected) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_urlarg_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* Lone project symbol named replace() — the weak short-name target the
+     * registry mis-binds str.replace to, so the call reaches emit_service_edge
+     * (mirrors ApiThing.load in the receiver-guard test above). */
+    write_temp_file(tmp, "src/util.ts",
+                    "export class Util {\n"
+                    "  replace(): string {\n"
+                    "    return '';\n"
+                    "  }\n"
+                    "}\n");
+    /* JSON-pointer unescape idiom from the observed swagger-ui garbage: the
+     * regex literal /~0/g must never become a URL/Route. */
+    write_temp_file(tmp, "src/re.ts",
+                    "export function fixPointer(str: string): string {\n"
+                    "  return str.replace(/~0/g, 'x');\n"
+                    "}\n");
+    /* Go filesystem path on a resolved same-package call: reaches
+     * emit_service_edge with a real target, svc NONE — no HTTP edge. */
+    write_temp_file(tmp, "hb/heartbeat.go",
+                    "package hb\n"
+                    "\n"
+                    "func checkFile(p string) int { return len(p) }\n"
+                    "\n"
+                    "func checkHeartBeat() int { return checkFile(\"/tmp/heartbeat\") }\n");
+    /* Genuine relative HTTP call: #523 bypass + arg_url -> 2 edges. */
+    write_temp_file(tmp, "src/api.ts",
+                    "export function callApi() {\n"
+                    "  return axios.get('/api/orders');\n"
+                    "}\n");
+    /* Genuine absolute HTTP call -> 1 edge (arg_url only takes '/'-leading). */
+    write_temp_file(tmp, "src/abs.ts",
+                    "export function callAbs() {\n"
+                    "  return axios.get('https://example.com/v1/x');\n"
+                    "}\n");
+    /* Template literal: the one URL-bearing kind without a ca->value. The
+     * backtick expr fallback must survive the kind gate (a value-only gate
+     * would silently kill `/things/${id}` client URLs) -> 2 edges + the
+     * :id-normalized arg_url Route. */
+    write_temp_file(tmp, "src/tpl.ts",
+                    "export function loadThing(id: string): unknown {\n"
+                    "  return axios.get(`/api/things/${id}`);\n"
+                    "}\n");
+    /* Filesystem path fed to a REAL HTTP client: the route-literal validator
+     * must reject it on both the has_url and the arg_url path. */
+    write_temp_file(tmp, "src/fs.ts",
+                    "export function readTmp(): unknown {\n"
+                    "  return axios.get('/tmp/test.txt');\n"
+                    "}\n");
+    /* Same via the native-fetch fallback, which calls the low-level emitter
+     * directly and so needs its own validator conjunct. */
+    write_temp_file(tmp, "src/fjson.ts",
+                    "export function readCfg(): unknown {\n"
+                    "  return fetch('/tmp/config.json');\n"
+                    "}\n");
+    /* Pad past MIN_FILES_FOR_PARALLEL (50) so the parallel resolver runs. */
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1); /* force parallel regardless of host cores */
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/urlarg_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Non-vacuity: the Go call resolved and went through emit_service_edge —
+     * without this, the /tmp/heartbeat asserts below could pass because Go
+     * extraction silently broke, not because the gate works. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "checkHeartBeat", "checkFile"));
+
+    /* Garbage never becomes a Route. */
+    ASSERT_EQ(count_nodes_named(s, project, "/~0/g"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/heartbeat"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/test.txt"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/config.json"), 0);
+    /* A validator-rejected bypass call must vanish, not degrade into a plain
+     * CALLS self-edge: the #523 callee-name bypass passes target=NULL exactly
+     * like the sequential twin, so the fall-through emitter has nothing to
+     * fabricate an edge to. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "readTmp", "readTmp"));
+
+    /* Genuine calls survive. */
+    ASSERT_GTE(count_nodes_named(s, project, "/api/orders"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "https://example.com/v1/x"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/api/things/:id"), 1);
+
+    /* Exactly the genuine edges: axios.get('/api/orders') 2 (#523 bypass +
+     * arg_url), absolute 1, template literal 2. A 6th edge means garbage got
+     * through; fewer means over-rejection. */
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 5);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Sequential twin (< 50 files -> pass_calls.c) of the route-literal filter:
+ * emit_http_async_edge's is_url must reject filesystem paths on both the #523
+ * callee bypass (axios) and the native-fetch empty-resolution path, while
+ * genuine relative and absolute URLs keep their HTTP_CALLS edges. pass_calls.c
+ * has no detect_url_in_args, so the regex/kind-gate half is parallel-only. */
+TEST(pipeline_sequential_route_literal_filter) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_urlarg_seq_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/api.ts",
+                    "export function callApi() {\n"
+                    "  return axios.get('/api/orders');\n"
+                    "}\n");
+    write_temp_file(tmp, "src/abs.ts",
+                    "export function callAbs() {\n"
+                    "  return axios.get('https://example.com/v1/x');\n"
+                    "}\n");
+    write_temp_file(tmp, "src/fs.ts",
+                    "export function readTmp(): unknown {\n"
+                    "  return axios.get('/tmp/test.txt');\n"
+                    "}\n");
+    write_temp_file(tmp, "src/fjson.ts",
+                    "export function readCfg(): unknown {\n"
+                    "  return fetch('/tmp/config.json');\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/urlarg_seq.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/test.txt"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/config.json"), 0);
+    ASSERT_GTE(count_nodes_named(s, project, "/api/orders"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "https://example.com/v1/x"), 1);
+    /* Exactly the two genuine edges (no arg_url doubling on this path). */
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 2);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -11644,6 +11832,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
+    RUN_TEST(pipeline_parallel_url_arg_regex_and_fs_paths_rejected);
+    RUN_TEST(pipeline_sequential_route_literal_filter);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);

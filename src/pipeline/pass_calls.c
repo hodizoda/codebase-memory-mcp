@@ -35,6 +35,10 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include <stdlib.h>
 #include <string.h>
 
+/* internal/cbm/service_patterns.c — not declared in service_patterns.h; same
+ * local-prototype idiom as pass_route_nodes.c. */
+bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
+
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
  * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
  * so same-module callee resolution keys against the directory-based def-node
@@ -352,8 +356,15 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_resolution_t *res, cbm_svc_kind_t svc,
                                  bool suppress_plain_calls) {
     const char *url_or_topic = call->first_string_arg;
+    /* Route-literal validation (twin of emit_service_edge's has_url in
+     * pass_parallel.c — keep both): a leading '/' alone also matches
+     * filesystem paths ("/tmp/heartbeat") and non-http schemes; the shared
+     * validator rejects those plus split/join-style callees. Real repos fed
+     * such args to HTTP clients and the garbage url_path became false
+     * cross-repo edges. */
     bool is_url = (url_or_topic && url_or_topic[0] != '\0' &&
-                   (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL));
+                   (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL) &&
+                   cbm_service_pattern_is_http_route_literal(url_or_topic, call->callee_name));
     bool is_topic = (url_or_topic && url_or_topic[0] != '\0' && svc == CBM_SVC_ASYNC &&
                      strlen(url_or_topic) > PAIR_LEN);
     if (!is_url && !is_topic) {

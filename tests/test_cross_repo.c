@@ -563,10 +563,14 @@ static bool cross_repo_seed_client_call(const cross_repo_fixture_t *fixture, con
 /* Seed a target-side Route (QN "__route__GET__<route_path>") plus one HANDLES
  * handler with caller-chosen name, file_path, and HANDLES properties. Called
  * repeatedly with the same route_path, the Route upserts to one node and the
- * handlers become competing HANDLES edges in insertion order. */
-static bool cross_repo_seed_route_handler(const cross_repo_fixture_t *fixture, const char *project,
-                                          const char *route_path, const char *handler_name,
-                                          const char *handler_file, const char *handles_props) {
+ * handlers become competing HANDLES edges in insertion order. root_path is
+ * the project row's indexed root — real fleet projects carry their repo path
+ * there, and host attribution matches against its basename. */
+static bool cross_repo_seed_route_handler_rooted(const cross_repo_fixture_t *fixture,
+                                                 const char *project, const char *root_path,
+                                                 const char *route_path, const char *handler_name,
+                                                 const char *handler_file,
+                                                 const char *handles_props) {
     char path[512];
     if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
         return false;
@@ -575,7 +579,7 @@ static bool cross_repo_seed_route_handler(const cross_repo_fixture_t *fixture, c
     if (!store) {
         return false;
     }
-    bool ok = cbm_store_upsert_project(store, project, fixture->cache) == CBM_STORE_OK;
+    bool ok = cbm_store_upsert_project(store, project, root_path) == CBM_STORE_OK;
     char route_qn[256];
     char handler_qn[256];
     char route_name[128];
@@ -602,6 +606,13 @@ static bool cross_repo_seed_route_handler(const cross_repo_fixture_t *fixture, c
     ok = ok && route_id > 0 && handler_id > 0 && cbm_store_insert_edge(store, &handles) > 0;
     cbm_store_close(store);
     return ok;
+}
+
+static bool cross_repo_seed_route_handler(const cross_repo_fixture_t *fixture, const char *project,
+                                          const char *route_path, const char *handler_name,
+                                          const char *handler_file, const char *handles_props) {
+    return cross_repo_seed_route_handler_rooted(fixture, project, fixture->cache, route_path,
+                                                handler_name, handler_file, handles_props);
 }
 
 /* Count edges of a type whose properties contain needle. */
@@ -815,6 +826,343 @@ TEST(cross_repo_interpolated_client_paths) {
     PASS();
 }
 
+/* Two repos each holding a near-duplicate client of the SAME third-party API
+ * (the fleet's tink/api.ts pair) must never pair with each other just because
+ * their canonical paths coincide: an absolute URL names its server by host,
+ * and api.tink.com attributes to no indexed project. */
+TEST(cross_repo_third_party_host_never_pairs_clients) {
+    static const char *const tink_url =
+        "https://api.tink.com/api/v1/credentials/third-party/callback/relayed";
+    static const char *const tink_path = "/api/v1/credentials/third-party/callback/relayed";
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "tink-a", tink_url, "ta") &&
+                 cross_repo_seed_route_handler(&fixture, "tink-a", tink_path, "relay_a", "server.c",
+                                               "{\"handler\":\"relay_a\"}") &&
+                 cross_repo_seed_client_call(&fixture, "tink-b", tink_url, "tb") &&
+                 cross_repo_seed_route_handler(&fixture, "tink-b", tink_path, "relay_b", "server.c",
+                                               "{\"handler\":\"relay_b\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed third-party host fixture");
+    }
+    const char *target = "tink-b";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("tink-a", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 1);
+    ASSERT_EQ(result.http_edges, 0);
+    PASS();
+}
+
+/* Over-fix guard: internal absolute calls survive. Fleet DNS is bare k8s
+ * service names, so "http://api:5000/federation" attributes to the indexed
+ * project "api" — and ONLY to it: a decoy target serving the same path gets
+ * nothing, because the host names which project serves the call. */
+TEST(cross_repo_bare_k8s_host_attributes_to_exact_project) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_client_call(&fixture, "k8s-src", "http://api:5000/federation", "fed") &&
+        cross_repo_seed_route_handler(&fixture, "api", "/federation", "handle_fed", "server.c",
+                                      "{\"handler\":\"handle_fed\"}") &&
+        cross_repo_seed_route_handler(&fixture, "impostor", "/federation", "handle_fake",
+                                      "server.c", "{\"handler\":\"handle_fake\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed bare-k8s fixture");
+    }
+    const char *targets[] = {"api", "impostor"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("k8s-src", targets, 2);
+    int to_api = cross_repo_count_edges_with_props(&fixture, "k8s-src", "CROSS_HTTP_CALLS",
+                                                   "\"target_project\":\"api\"");
+    int to_impostor = cross_repo_count_edges_with_props(&fixture, "k8s-src", "CROSS_HTTP_CALLS",
+                                                        "\"target_project\":\"impostor\"");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 2);
+    ASSERT_EQ(result.http_edges, 1);
+    ASSERT_EQ(to_api, 1);
+    ASSERT_EQ(to_impostor, 0);
+    PASS();
+}
+
+/* The k8s host label is often NOT the repo name: host "ddi" is repo
+ * "ddi-service". Attribution must tolerate the "<host>-service" spelling. */
+TEST(cross_repo_host_service_suffix_attributes) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "suffix-src", "http://ddi:3010/x", "sx") &&
+                 cross_repo_seed_route_handler(&fixture, "ddi-service", "/x", "handle_x",
+                                               "server.c", "{\"handler\":\"handle_x\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed host-service suffix fixture");
+    }
+    const char *target = "ddi-service";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("suffix-src", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 1);
+    PASS();
+}
+
+/* A host whose candidate names match MORE than one indexed project ("amb"
+ * AND "amb-service" both indexed) attributes to nothing — never guess. */
+TEST(cross_repo_ambiguous_host_attributes_to_nothing) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "amb-src", "http://amb:3010/y", "ay") &&
+                 cross_repo_seed_route_handler(&fixture, "amb", "/y", "handle_y1", "server.c",
+                                               "{\"handler\":\"handle_y1\"}") &&
+                 cross_repo_seed_route_handler(&fixture, "amb-service", "/y", "handle_y2",
+                                               "server.c", "{\"handler\":\"handle_y2\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed ambiguous host fixture");
+    }
+    const char *targets[] = {"amb", "amb-service"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("amb-src", targets, 2);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 2);
+    ASSERT_EQ(result.http_edges, 0);
+    PASS();
+}
+
+/* The fleet uses BOTH spellings for the same repo: bare "api" (supergraph
+ * routing_url) and "api-service" (infra/env). A "-service"-suffixed host must
+ * attribute to the bare-named project. */
+TEST(cross_repo_service_suffixed_host_attributes_to_bare_project) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "strip-src",
+                                             "http://api-service:5000/federation", "st") &&
+                 cross_repo_seed_route_handler(&fixture, "api", "/federation", "handle_fed",
+                                               "server.c", "{\"handler\":\"handle_fed\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed suffixed-host fixture");
+    }
+    const char *target = "api";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("strip-src", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 1);
+    PASS();
+}
+
+/* Internal domains are config-driven (CBM_CROSS_REPO_INTERNAL_DOMAINS) and
+ * EMPTY by default: with the suffix configured, the first label of an
+ * internal host attributes; without it, the same host attributes to nothing.
+ * api.tink.com stays rejected either way — .tink.com is never configured
+ * (regression pinned by cross_repo_third_party_host_never_pairs_clients).
+ * The gateway URL carries an UPPERCASE domain: suffix matching happens on
+ * the case-folded host, which this pins. Fixture DNS is RFC 2606-reserved
+ * (.example), never a real site domain. */
+TEST(cross_repo_internal_domain_host_attributes_first_label) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_client_call(&fixture, "fleet-src", "https://api.corp.example/graphql",
+                                    "gq") &&
+        cross_repo_seed_client_call(&fixture, "fleet-src", "https://gateway.CORP.EXAMPLE/internal",
+                                    "in") &&
+        cross_repo_seed_route_handler(&fixture, "api", "/graphql", "handle_gql", "server.c",
+                                      "{\"handler\":\"handle_gql\"}") &&
+        cross_repo_seed_route_handler(&fixture, "gateway", "/internal", "handle_int", "server.c",
+                                      "{\"handler\":\"handle_int\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed internal-domain fixture");
+    }
+    const char *targets[] = {"api", "gateway"};
+    /* Default (unset) list: internal-domain hosts attribute to nothing. */
+    (void)cbm_unsetenv("CBM_CROSS_REPO_INTERNAL_DOMAINS");
+    cbm_cross_repo_result_t unconfigured = cbm_cross_repo_match("fleet-src", targets, 2);
+    /* Configured: the first label attributes. */
+    (void)cbm_setenv("CBM_CROSS_REPO_INTERNAL_DOMAINS", ".corp.example", 1);
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("fleet-src", targets, 2);
+    (void)cbm_unsetenv("CBM_CROSS_REPO_INTERNAL_DOMAINS");
+    int to_api = cross_repo_count_edges_with_props(&fixture, "fleet-src", "CROSS_HTTP_CALLS",
+                                                   "\"target_project\":\"api\"");
+    int to_gateway = cross_repo_count_edges_with_props(&fixture, "fleet-src", "CROSS_HTTP_CALLS",
+                                                       "\"target_project\":\"gateway\"");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(unconfigured.failed);
+    ASSERT_EQ(unconfigured.http_edges, 0);
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 2);
+    ASSERT_EQ(to_api, 1);
+    ASSERT_EQ(to_gateway, 1);
+    PASS();
+}
+
+/* Userinfo is live in this fleet (postgres:// creds, Sentry DSN keys): the
+ * host is what follows the LAST '@' of the authority, not "user:pass@host". */
+TEST(cross_repo_userinfo_url_extracts_host) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "userinfo-src",
+                                             "http://user:secret@api:5000/graphql", "ui") &&
+                 cross_repo_seed_route_handler(&fixture, "api", "/graphql", "handle_gql",
+                                               "server.c", "{\"handler\":\"handle_gql\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed userinfo fixture");
+    }
+    const char *target = "api";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("userinfo-src", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 1);
+    PASS();
+}
+
+/* THE fleet-shape test: real project names are path-mangled full paths
+ * ("Users-x-repos-anyfin-api", cbm_project_name_from_path), and the store
+ * row carries the repo root. A bare k8s host ("api") must attribute via the
+ * root's BASENAME — whole-name comparison never fires on a real fleet, which
+ * is exactly what bare-named fixtures could not catch. */
+TEST(cross_repo_mangled_project_name_attributes_via_root_basename) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "mangled-src",
+                                             "http://api:5000/federation", "mg") &&
+                 cross_repo_seed_route_handler_rooted(
+                     &fixture, "Users-x-repos-anyfin-api", "/Users/x/repos/anyfin/api",
+                     "/federation", "handle_fed", "server.c", "{\"handler\":\"handle_fed\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed mangled-name fixture");
+    }
+    const char *target = "Users-x-repos-anyfin-api";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("mangled-src", &target, 1);
+    int to_mangled =
+        cross_repo_count_edges_with_props(&fixture, "mangled-src", "CROSS_HTTP_CALLS",
+                                          "\"target_project\":\"Users-x-repos-anyfin-api\"");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 1);
+    ASSERT_EQ(to_mangled, 1);
+    PASS();
+}
+
+/* Two indexed clones with the SAME repo basename ("api" from .../a/api and
+ * .../b/api) make a bare "api" host ambiguous — attribute to neither. */
+TEST(cross_repo_mangled_basename_collision_is_ambiguous) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_client_call(&fixture, "collide-src", "http://api:5000/z", "cl") &&
+        cross_repo_seed_route_handler_rooted(&fixture, "Users-x-repos-a-api",
+                                             "/Users/x/repos/a/api", "/z", "handle_a", "server.c",
+                                             "{\"handler\":\"handle_a\"}") &&
+        cross_repo_seed_route_handler_rooted(&fixture, "Users-x-repos-b-api",
+                                             "/Users/x/repos/b/api", "/z", "handle_b", "server.c",
+                                             "{\"handler\":\"handle_b\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed basename-collision fixture");
+    }
+    const char *targets[] = {"Users-x-repos-a-api", "Users-x-repos-b-api"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("collide-src", targets, 2);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 2);
+    ASSERT_EQ(result.http_edges, 0);
+    PASS();
+}
+
+/* The mirror of the uppercase-host case: a lowercase host must attribute to
+ * a project whose REPO BASENAME carries uppercase ("MyApi"). The host fold
+ * cannot help here — only the case-insensitive identity comparison can. */
+TEST(cross_repo_uppercase_repo_basename_attributes) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "camel-src", "http://myapi:5000/x", "cm") &&
+                 cross_repo_seed_route_handler_rooted(&fixture, "Users-x-repos-anyfin-MyApi",
+                                                      "/Users/x/repos/anyfin/MyApi", "/x",
+                                                      "handle_x", "server.c",
+                                                      "{\"handler\":\"handle_x\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed uppercase-basename fixture");
+    }
+    const char *target = "Users-x-repos-anyfin-MyApi";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("camel-src", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 1);
+    PASS();
+}
+
+/* DNS hostnames are case-insensitive: an uppercase internal host must still
+ * attribute (case folding at extraction, case-insensitive identity match). */
+TEST(cross_repo_uppercase_internal_host_attributes) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_client_call(&fixture, "case-src", "http://API:5000/federation",
+                                             "up") &&
+                 cross_repo_seed_route_handler(&fixture, "api", "/federation", "handle_fed",
+                                               "server.c", "{\"handler\":\"handle_fed\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed uppercase-host fixture");
+    }
+    const char *target = "api";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("case-src", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 1);
+    PASS();
+}
+
+/* External hosts attribute to nothing even when a project SERVES the path:
+ * a Cloud Functions host (the function name lives in the PATH, not the
+ * host), a Sentry DSN, and an IPv6 literal. The decoy target is named after
+ * the function and serves all three paths, so ONLY host attribution blocks
+ * the edges. */
+TEST(cross_repo_external_hosts_attribute_to_nothing) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_client_call(&fixture, "ext-src",
+                                    "https://europe-west1-anyfin.cloudfunctions.net/ddi-pipeline",
+                                    "cf") &&
+        cross_repo_seed_client_call(&fixture, "ext-src", "https://abc123key@sentry.io/1325984",
+                                    "sn") &&
+        cross_repo_seed_client_call(&fixture, "ext-src", "http://[::1]:8080/x", "v6") &&
+        cross_repo_seed_route_handler(&fixture, "ddi-pipeline", "/ddi-pipeline", "handle_cf",
+                                      "server.c", "{\"handler\":\"handle_cf\"}") &&
+        cross_repo_seed_route_handler(&fixture, "ddi-pipeline", "/1325984", "handle_sn",
+                                      "server.c", "{\"handler\":\"handle_sn\"}") &&
+        cross_repo_seed_route_handler(&fixture, "ddi-pipeline", "/x", "handle_v6", "server.c",
+                                      "{\"handler\":\"handle_v6\"}");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed external-host fixture");
+    }
+    const char *target = "ddi-pipeline";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("ext-src", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 0);
+    PASS();
+}
+
 /* The two rows of a bidirectional pair carry OPPOSITE meanings under the same
  * property names (forward: target_* = handler; reverse: target_* = caller).
  * Each row must say which reading applies — the unmarked reverse rows read as
@@ -861,5 +1209,17 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_route_handled_only_by_test_file_is_unresolvable);
     RUN_TEST(cross_repo_prefers_production_handler_over_test_and_inline);
     RUN_TEST(cross_repo_interpolated_client_paths);
+    RUN_TEST(cross_repo_third_party_host_never_pairs_clients);
+    RUN_TEST(cross_repo_bare_k8s_host_attributes_to_exact_project);
+    RUN_TEST(cross_repo_host_service_suffix_attributes);
+    RUN_TEST(cross_repo_ambiguous_host_attributes_to_nothing);
+    RUN_TEST(cross_repo_service_suffixed_host_attributes_to_bare_project);
+    RUN_TEST(cross_repo_internal_domain_host_attributes_first_label);
+    RUN_TEST(cross_repo_userinfo_url_extracts_host);
+    RUN_TEST(cross_repo_external_hosts_attribute_to_nothing);
+    RUN_TEST(cross_repo_mangled_project_name_attributes_via_root_basename);
+    RUN_TEST(cross_repo_mangled_basename_collision_is_ambiguous);
+    RUN_TEST(cross_repo_uppercase_repo_basename_attributes);
+    RUN_TEST(cross_repo_uppercase_internal_host_attributes);
     RUN_TEST(cross_repo_rows_carry_direction_marker);
 }

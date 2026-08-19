@@ -401,9 +401,93 @@ TEST(cross_links_empty_result_explains_cross_repo_indexing) {
     PASS();
 }
 
+/* Seed a link whose properties carry a direction marker, the way Stage-2
+ * pass_cross_repo stores bidirectional rows. */
+static bool xlink_seed_directed_link(cbm_store_t *store, const char *project, const char *src_qn,
+                                     const char *direction) {
+    char route_qn[256];
+    snprintf(route_qn, sizeof(route_qn), "%s.route", src_qn);
+    cbm_node_t source = {.project = project,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = src_qn,
+                         .file_path = "src/client.ts"};
+    cbm_node_t route = {.project = project,
+                        .label = "Route",
+                        .name = "route",
+                        .qualified_name = route_qn,
+                        .file_path = "src/client.ts"};
+    int64_t source_id = cbm_store_upsert_node(store, &source);
+    int64_t route_id = cbm_store_upsert_node(store, &route);
+    if (source_id <= 0 || route_id <= 0) {
+        return false;
+    }
+    char props[512];
+    snprintf(props, sizeof(props),
+             "{\"target_project\":\"payments\",\"target_function\":\"chargeCaller\","
+             "\"target_file\":\"api/handler.ts\",\"url_path\":\"/v1/charge\","
+             "\"direction\":\"%s\"}",
+             direction);
+    cbm_edge_t edge = {.project = project,
+                       .source_id = source_id,
+                       .target_id = route_id,
+                       .type = "CROSS_HTTP_CALLS",
+                       .properties_json = props};
+    return cbm_store_insert_edge(store, &edge) > 0;
+}
+
+/* A reverse row's target_* fields name the remote CALLER, not a handler; the
+ * stored direction marker must be visible in the tool output or the report
+ * reads backwards (this misled a fleet audit). Rows predating the marker
+ * render "-" via the empty-cell placeholder. */
+TEST(cross_links_rows_surface_direction_marker) {
+    xlink_fixture_t fixture;
+    if (!xlink_fixture_begin(&fixture)) {
+        FAIL("fixture setup failed");
+    }
+    const char *project = "xlink-direction-src";
+    cbm_store_t *store = xlink_open_project(&fixture, project);
+    if (!store) {
+        xlink_fixture_end(&fixture);
+        FAIL("store setup failed");
+    }
+    bool seeded = xlink_seed_directed_link(store, project, "xld.rev", "reverse") &&
+                  xlink_seed_link(store, project, "xld.legacy", "CROSS_HTTP_CALLS", "payments",
+                                  "handleCharge", "url_path", "/v1/legacy");
+    cbm_store_close(store);
+    if (!seeded) {
+        xlink_fixture_end(&fixture);
+        FAIL("seeding failed");
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[256];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+    char *r = cbm_mcp_handle_tool(srv, "cross_project_links", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "target_file via direction"));
+    ASSERT_NOT_NULL(strstr(r, "reverse"));
+    ASSERT_NOT_NULL(strstr(r, "\"isError\":false"));
+    free(r);
+
+    /* Legacy JSON path carries the same column. */
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"format\":\"json\"}", project);
+    r = cbm_mcp_handle_tool(srv, "cross_project_links", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "direction"));
+    ASSERT_NOT_NULL(strstr(r, "reverse"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    xlink_fixture_end(&fixture);
+    PASS();
+}
+
 SUITE(cross_project_links) {
     RUN_TEST(cross_links_lists_seeded_edges);
     RUN_TEST(cross_links_summary_only_returns_counts_not_rows);
     RUN_TEST(cross_links_pagination_returns_each_row_exactly_once);
+    RUN_TEST(cross_links_rows_surface_direction_marker);
     RUN_TEST(cross_links_empty_result_explains_cross_repo_indexing);
 }

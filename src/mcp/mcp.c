@@ -11469,7 +11469,8 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
                  "coalesce(json_extract(e.properties,'$.target_function'),''), "
                  "coalesce(json_extract(e.properties,'$.target_file'),''), "
                  "coalesce(json_extract(e.properties,'$.url_path'),"
-                 "json_extract(e.properties,'$.channel_name'),'') "
+                 "json_extract(e.properties,'$.channel_name'),''), "
+                 "coalesce(json_extract(e.properties,'$.direction'),'') "
                  "FROM edges e LEFT JOIN nodes n ON n.id = e.source_id "
                  "WHERE %s "
                  "ORDER BY e.type, json_extract(e.properties,'$.target_project'), e.id "
@@ -11542,7 +11543,7 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
             yyjson_mut_val *lk_cols = yyjson_mut_arr(doc);
             static const char *const link_cols[] = {"protocol",       "source", "source_file",
                                                     "target_project", "target", "target_file",
-                                                    "via"};
+                                                    "via",            "direction"};
             for (size_t c = 0; c < sizeof(link_cols) / sizeof(link_cols[0]); c++) {
                 yyjson_mut_arr_add_str(doc, lk_cols, link_cols[c]);
             }
@@ -11551,7 +11552,7 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
             int emitted = 0;
             while (sqlite3_step(rows_stmt) == SQLITE_ROW) {
                 yyjson_mut_val *row = yyjson_mut_arr(doc);
-                for (int c = 0; c < 7; c++) {
+                for (int c = 0; c < 8; c++) {
                     const char *v = (const char *)sqlite3_column_text(rows_stmt, c);
                     yyjson_mut_arr_add_strcpy(doc, row, v ? v : "");
                 }
@@ -11618,6 +11619,7 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
             const char *tgt_fn = (const char *)sqlite3_column_text(rows_stmt, 4);
             const char *tgt_file = (const char *)sqlite3_column_text(rows_stmt, 5);
             const char *via = (const char *)sqlite3_column_text(rows_stmt, 6);
+            const char *dir = (const char *)sqlite3_column_text(rows_stmt, 7);
             char group[CBM_SZ_512];
             snprintf(group, sizeof(group), "%s -> %s", type ? type : "",
                      (tp && tp[0]) ? tp : "(unknown)");
@@ -11632,11 +11634,16 @@ static char *handle_cross_project_links(cbm_mcp_server_t *srv, const char *args)
             cbm_tree_cell_str(&rows, tgt_fn, false);
             cbm_tree_cell_str(&rows, tgt_file, false);
             cbm_tree_cell_str(&rows, via, false);
+            cbm_tree_cell_str(&rows, dir, false);
             cbm_tree_row_end(&rows);
             emitted++;
         }
+        /* direction disambiguates the row's reading: "forward" = target_* is
+         * the remote HANDLER, "reverse" = target_* is the remote CALLER. An
+         * unmarked reverse row reads as though its caller were a handler,
+         * which misled a fleet audit. "-" = pre-direction row. */
         snprintf(buf, sizeof(buf),
-                 "links: %d  (rows: source source_file target target_file via; group = "
+                 "links: %d  (rows: source source_file target target_file via direction; group = "
                  "protocol -> target_project; source symbols are in this project)\n",
                  emitted);
         cbm_sb_append(&sb, buf);

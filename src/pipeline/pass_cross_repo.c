@@ -41,6 +41,8 @@ enum {
     CR_SCHEME_SKIP = 3,      /* strlen("://") */
     CR_ROUTE_PREFIX_LEN = 9, /* strlen("__route__") */
     CR_ANY_LEN = 3,          /* strlen("ANY") */
+    CR_RUN_APP_LEN = 8,      /* strlen(".run.app") */
+    CR_HOST_NAMES = 4,       /* host, host-service, cloud-run svc, svc-service */
 };
 
 #define CR_MS_PER_SEC 1000.0
@@ -52,10 +54,23 @@ typedef enum {
     CR_RUN_CANCELLED,
 } cr_run_status_t;
 
+/* Identity of an indexed project: its (path-mangled) name plus the basename
+ * of its indexed root. Real fleet project names are full mangled paths
+ * ("Users-x-repos-anyfin-api", cbm_project_name_from_path), so a bare URL
+ * host ("api") can only be matched via the root's basename — whole-name
+ * comparison never fires on a real fleet. */
+typedef struct {
+    char name[CBM_SZ_256];
+    char basename[CBM_SZ_256];
+} cr_ident_t;
+
 typedef struct {
     const atomic_int *cancelled;
     bool cancellation_observed;
     bool mutated;
+    /* Source + resolved targets of this run, for host attribution. */
+    const cr_ident_t *universe;
+    int universe_count;
 } cr_run_context_t;
 
 static CBM_TLS cbm_cross_repo_after_insert_test_hook_t cr_after_insert_test_hook = NULL;
@@ -120,7 +135,14 @@ static int cr_project_compare(const void *left, const void *right) {
     return strcmp(*left_project, *right_project);
 }
 
-static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) {
+/* Exact-project acceptance plus identity capture: when basename_out is given,
+ * it receives the basename of the primary row's root_path (empty when
+ * unavailable). */
+static bool cr_store_project_ident(cbm_store_t *store, const char *project, char *basename_out,
+                                   size_t basename_sz) {
+    if (basename_out && basename_sz > 0) {
+        basename_out[0] = '\0';
+    }
     cbm_project_t *projects = NULL;
     int count = 0;
     if (!store || !cbm_store_check_integrity(store) ||
@@ -146,11 +168,46 @@ static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) 
         if (name && name[0] && !strstr(name, "::")) {
             primary_count++;
             primary_matches = strcmp(name, project) == 0;
+            const char *root = projects[i].root_path;
+            if (basename_out && basename_sz > 0 && root && root[0]) {
+                size_t end = strlen(root);
+                while (end > 0 && root[end - 1] == '/') {
+                    end--;
+                }
+                size_t start = end;
+                while (start > 0 && root[start - 1] != '/') {
+                    start--;
+                }
+                if (end > start) {
+                    snprintf(basename_out, basename_sz, "%.*s", (int)(end - start), root + start);
+                }
+            }
         }
     }
     bool matches = primary_count == 1 && primary_matches;
     cbm_store_free_projects(projects, count);
     return matches;
+}
+
+static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) {
+    return cr_store_project_ident(store, project, NULL, 0);
+}
+
+/* cr_project_exists plus identity capture for the run universe. */
+static bool cr_project_ident(const char *project, cr_ident_t *out) {
+    memset(out, 0, sizeof(*out));
+    char path[CR_PATH_BUF];
+    if (!cr_db_path(project, path, sizeof(path))) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(path);
+    bool ok = cr_store_project_ident(store, project, out->basename, sizeof(out->basename));
+    cbm_store_close(store);
+    if (!ok) {
+        return false;
+    }
+    snprintf(out->name, sizeof(out->name), "%s", project);
+    return true;
 }
 
 static bool cr_project_exists(const char *project) {
@@ -302,6 +359,211 @@ static const char *cr_url_path(const char *url) {
     }
     const char *path_start = strchr(scheme_end + CR_SCHEME_SKIP, '/');
     return path_start ? path_start : "/";
+}
+
+/* Extract the authority's host (userinfo and port stripped) from an absolute
+ * URL. Userinfo is REAL in this fleet — "postgres://user:pass@test_db:5432/x"
+ * and Sentry DSNs "https://<key>@sentry.io/1325984" — and ends at the LAST
+ * '@' inside the authority. An IPv6 literal ("[::1]:8080") is extracted
+ * verbatim with its brackets: it can never name an indexed project, so it
+ * fails attribution downstream instead of being mis-split on ':'. A '#'
+ * before any '/' terminates the authority like '/' does (such a URL also has
+ * no path, so the host-only gate already discards it before attribution). */
+static bool cr_abs_url_host(const char *url, char *buf, size_t bufsz) {
+    const char *scheme_end = url ? strstr(url, "://") : NULL;
+    if (!scheme_end) {
+        return false;
+    }
+    const char *h = scheme_end + CR_SCHEME_SKIP;
+    size_t auth_end = 0;
+    while (h[auth_end] && h[auth_end] != '/' && h[auth_end] != '?' && h[auth_end] != '#') {
+        auth_end++;
+    }
+    for (size_t i = auth_end; i > 0; i--) {
+        if (h[i - 1] == '@') {
+            h += i;
+            auth_end -= i;
+            break;
+        }
+    }
+    size_t n = 0;
+    if (h[0] == '[') {
+        while (n < auth_end && h[n] != ']') {
+            n++;
+        }
+        if (n < auth_end) {
+            n++; /* include the closing ']' */
+        }
+    } else {
+        while (n < auth_end && h[n] != ':') {
+            n++;
+        }
+    }
+    if (n == 0 || n >= bufsz) {
+        return false;
+    }
+    memcpy(buf, h, n);
+    buf[n] = '\0';
+    /* DNS hostnames are case-insensitive; fold once here so every candidate
+     * derived from the host compares in lowercase. */
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] >= 'A' && buf[i] <= 'Z') {
+            buf[i] = (char)(buf[i] + ('a' - 'A'));
+        }
+    }
+    return true;
+}
+
+/* ASCII case-insensitive equality — hosts fold to lowercase, but project
+ * names and repo basenames may carry any case. */
+static bool cr_ieq(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + ('a' - 'A')) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + ('a' - 'A')) : *b;
+        if (ca != cb) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* Optional internal-domain suffixes for first-label extraction, read from
+ * CBM_CROSS_REPO_INTERNAL_DOMAINS ("comma,separated,suffixes" — e.g.
+ * ".corp.example"). EMPTY BY DEFAULT and deliberately config-driven, not a
+ * compiled-in list (site DNS does not belong in source) and not a general
+ * heuristic: first-label extraction is only safe on domains the deployment
+ * controls. Generalizing it to any dotted host would turn "api.tink.com" —
+ * a third-party API — into "api" and hand its traffic to the "api" project,
+ * which is the exact false-positive class the host gate removed. Suffixes
+ * are matched against the lowercased host. Known permanent false negative:
+ * "*.cloudfunctions.net" can never be attributed by ANY host-based scheme —
+ * its first label is a region-project pair and the function name lives in
+ * the PATH. */
+static bool cr_host_in_internal_domains(const char *host) {
+    const char *list = getenv("CBM_CROSS_REPO_INTERNAL_DOMAINS");
+    if (!list || !list[0]) {
+        return false;
+    }
+    size_t hlen = strlen(host);
+    const char *p = list;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        size_t dlen = end ? (size_t)(end - p) : strlen(p);
+        if (dlen > 0 && dlen < hlen && strncmp(host + hlen - dlen, p, dlen) == 0) {
+            return true;
+        }
+        p = end ? end + 1 : p + dlen;
+    }
+    return false;
+}
+
+/* Add a candidate project name plus its repo-spelling counterpart: fleet k8s
+ * DNS uses BOTH bare "api" (supergraph routing_url) and "api-service"
+ * (infra/env) for the SAME repo, so bare "ddi" also tries "ddi-service" and
+ * "api-service" also tries "api". */
+static void cr_add_host_candidates(char names[][CBM_SZ_256], int *count, const char *name) {
+    static const char service_suffix[] = "-service";
+    const size_t suffix_len = sizeof(service_suffix) - 1;
+    snprintf(names[(*count)++], CBM_SZ_256, "%s", name);
+    size_t len = strlen(name);
+    if (len > suffix_len && strcmp(name + len - suffix_len, service_suffix) == 0) {
+        snprintf(names[(*count)++], CBM_SZ_256, "%.*s", (int)(len - suffix_len), name);
+    } else {
+        snprintf(names[(*count)++], CBM_SZ_256, "%s%s", name, service_suffix);
+    }
+}
+
+/* True when an absolute client URL's host attributes — uniquely — to the
+ * given target project. Fleet-internal DNS is bare Kubernetes service names
+ * whose repo is often "<host>-service" (app → app-service, ddi →
+ * ddi-service), so both spellings are candidates; a Cloud Run host
+ * additionally names its service in the first label under generated hash
+ * suffixes. Everything else attributes on the FULL host, so a third-party
+ * "api.tink.com" can never borrow the "api" project. A host whose candidates
+ * name MORE than one indexed project attributes to nothing — never guess.
+ * The existence probes run only when a candidate names tgt_project, so the
+ * common miss (host names some other project) costs no store opens. */
+static bool cr_abs_host_names_target(const char *url, const char *tgt_project,
+                                     const cr_run_context_t *ctx) {
+    char host[CBM_SZ_256];
+    if (!ctx || !ctx->universe || !cr_abs_url_host(url, host, sizeof(host))) {
+        return false;
+    }
+    char names[CR_HOST_NAMES][CBM_SZ_256];
+    int name_count = 0;
+    cr_add_host_candidates(names, &name_count, host);
+    /* A dotted host yields a first-label candidate ONLY for Cloud Run
+     * (".run.app", whose first label carries generated hash suffixes that
+     * cbm_route_extract_service_name strips — fully only for new-format
+     * digit-suffix hosts) or configured internal domains
+     * (cr_host_in_internal_domains: "api.corp.example" → "api", taken
+     * VERBATIM with no hash stripping so "api-v2.corp.example" can never
+     * collapse into "api"). */
+    size_t hlen = strlen(host);
+    bool run_app = hlen > CR_RUN_APP_LEN && strcmp(host + hlen - CR_RUN_APP_LEN, ".run.app") == 0;
+    if (run_app || cr_host_in_internal_domains(host)) {
+        char svc[CBM_SZ_256];
+        const char *label = NULL;
+        if (run_app) {
+            label = cbm_route_extract_service_name(url, svc, (int)sizeof(svc));
+        } else {
+            size_t n = 0;
+            while (host[n] && host[n] != '.') {
+                n++;
+            }
+            if (n > 0 && n < sizeof(svc)) {
+                memcpy(svc, host, n);
+                svc[n] = '\0';
+                label = svc;
+            }
+        }
+        if (label && label[0] && strcmp(label, host) != 0) {
+            cr_add_host_candidates(names, &name_count, label);
+        }
+    }
+    /* A candidate names a project when it equals the project's full name OR
+     * its repo basename (case-insensitive). Real fleet names are mangled
+     * paths ("Users-x-repos-anyfin-api"), so the basename comparison is the
+     * one that fires; whole-name equality keeps bare-named stores working.
+     * The edge is allowed only when THIS target is named and no other
+     * project is: never guess between two plausible servers. */
+    bool tgt_named = false;
+    int projects_named = 0;
+    for (int p = 0; p < ctx->universe_count; p++) {
+        const cr_ident_t *ident = &ctx->universe[p];
+        if (!ident->name[0]) {
+            continue; /* empty slot (self-target) */
+        }
+        bool named = false;
+        for (int i = 0; i < name_count && !named; i++) {
+            named = cr_ieq(names[i], ident->name) ||
+                    (ident->basename[0] && cr_ieq(names[i], ident->basename));
+        }
+        if (named) {
+            projects_named++;
+            if (strcmp(ident->name, tgt_project) == 0) {
+                tgt_named = true;
+            }
+        }
+    }
+    if (!tgt_named) {
+        return false;
+    }
+    /* Bare-named indexed stores OUTSIDE this run's universe still count
+     * toward ambiguity: a candidate that IS such a store's project name
+     * names a second plausible server even if this run does not scan it. */
+    for (int i = 0; i < name_count; i++) {
+        bool in_universe = false;
+        for (int p = 0; p < ctx->universe_count && !in_universe; p++) {
+            in_universe = ctx->universe[p].name[0] && cr_ieq(names[i], ctx->universe[p].name);
+        }
+        if (!in_universe && cr_project_exists(names[i])) {
+            projects_named++;
+        }
+    }
+    return projects_named == 1;
 }
 
 /* Look up a node's name and file_path by id. */
@@ -717,6 +979,14 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
          * literal-segment rule. Same rule here: no literal anchor, no
          * rendezvous. */
         if (cr_template_is_all_placeholder(curl)) {
+            continue;
+        }
+        /* An absolute URL names its server by host. Require the host to
+         * attribute — uniquely — to the target project of THIS match, or
+         * emit nothing: two clients of the same third-party API otherwise
+         * pair with each other whenever their canonical paths coincide
+         * (the residual api.tink.com false positives). */
+        if (strstr(url_path, "://") && !cr_abs_host_names_target(url_path, tgt_project, ctx)) {
             continue;
         }
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
@@ -1320,24 +1590,42 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         result.failed = !result.cancelled;
         return result;
     }
+    /* Project identities for host attribution: a bare URL host can only be
+     * matched via each project's root basename (fleet names are mangled
+     * paths), and host→project ambiguity is judged across the projects this
+     * run touches. Slot 0 is the source; a self-target keeps its slot empty
+     * rather than duplicating the source, which would read as ambiguity. */
+    cr_ident_t *universe = calloc((size_t)resolved_count + 1, sizeof(*universe));
+    if (!universe || !cr_project_ident(project, &universe[0])) {
+        result.failed = true;
+        free(universe);
+        free_project_list(resolved, resolved_count);
+        return result;
+    }
     for (int i = 0; i < resolved_count; i++) {
         if (cr_cancel_requested(&run)) {
             result.cancelled = true;
+            free(universe);
             free_project_list(resolved, resolved_count);
             return result;
         }
-        if (strcmp(resolved[i], project) != 0 && !cr_project_exists(resolved[i])) {
+        if (strcmp(resolved[i], project) != 0 &&
+            !cr_project_ident(resolved[i], &universe[i + 1])) {
             result.failed = true;
+            free(universe);
             free_project_list(resolved, resolved_count);
             return result;
         }
     }
+    run.universe = universe;
+    run.universe_count = resolved_count + 1;
 
     /* Every input is known to exist before destructive source cleanup. The
      * read-write open itself also omits CREATE so a race cannot create ghosts. */
     cbm_store_t *src_store = cr_open_existing_project(project);
     if (!src_store) {
         result.failed = true;
+        free(universe);
         free_project_list(resolved, resolved_count);
         return result;
     }
@@ -1345,6 +1633,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
     if (cr_cancel_requested(&run)) {
         result.cancelled = true;
         cbm_store_close(src_store);
+        free(universe);
         free_project_list(resolved, resolved_count);
         return result;
     }
@@ -1356,6 +1645,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         result.partial_results = result.cancelled && run.mutated;
         result.failed = cleanup_status == CR_RUN_FAILED;
         cbm_store_close(src_store);
+        free(universe);
         free_project_list(resolved, resolved_count);
         return result;
     }
@@ -1435,6 +1725,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
 
     cbm_store_close(src_store);
 
+    free(universe);
     free_project_list(resolved, resolved_count);
 
     struct timespec t1;

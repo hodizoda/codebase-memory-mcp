@@ -254,7 +254,13 @@ static bool cr536_setup(RProj *client, const char *client_py, RProj *server,
     int client_http = rh_count_edges(cs, client->project, "HTTP_CALLS");
     cbm_store_close(cs);
 
-    cbm_store_t *ss = rh_index(server, "server/app.py", server_py);
+    /* The server repo dir is NAMED after the host the client's full-URL
+     * fixture dials ("order-api.internal"): cross-repo host attribution only
+     * matches an absolute URL to a project whose root basename the host
+     * names, so a random mkdtemp basename would make the full-URL leg
+     * unmatchable by design rather than by the #523 defect. */
+    RFile server_file = {"server/app.py", server_py};
+    cbm_store_t *ss = rh_index_files_named(server, "order-api.internal", &server_file, 1);
     if (!ss) {
         return false;
     }

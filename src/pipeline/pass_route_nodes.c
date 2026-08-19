@@ -271,8 +271,10 @@ static void strip_cloud_run_suffixes(char *hostname) {
 }
 
 /* Extract service name from Cloud Run URL hostname.
- * "my-svc-ab12cd34ef-uc.a.run.app/path" → "my-svc" */
-static const char *extract_service_name(const char *url, char *buf, int bufsz) {
+ * "my-svc-ab12cd34ef-uc.a.run.app/path" → "my-svc"
+ * Exported (pipeline_internal.h): pass_cross_repo.c reuses it for host
+ * attribution of Cloud Run client URLs. */
+const char *cbm_route_extract_service_name(const char *url, char *buf, int bufsz) {
     if (!url) {
         return NULL;
     }
@@ -389,7 +391,8 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
 
         const char *infra_path = url_path(infra->name);
         char svc_buf[CBM_SZ_128];
-        const char *svc_name = extract_service_name(infra->name, svc_buf, sizeof(svc_buf));
+        const char *svc_name =
+            cbm_route_extract_service_name(infra->name, svc_buf, sizeof(svc_buf));
         if (!infra_path || !svc_name) {
             continue;
         }

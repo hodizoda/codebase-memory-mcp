@@ -44,6 +44,13 @@
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
 
+/* Extract the service name from an absolute URL's hostname: the first host
+ * label, with generated Cloud Run hash suffixes stripped
+ * ("my-svc-ab12cd34ef-uc.a.run.app/path" → "my-svc"). Defined in
+ * pass_route_nodes.c; shared with cross-repo host attribution. Returns buf,
+ * or NULL when the URL has no authority. */
+const char *cbm_route_extract_service_name(const char *url, char *buf, int bufsz);
+
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
  * cbm_lang_module_is_dir) a file's module QN equals its directory QN, so an

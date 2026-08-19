@@ -50,7 +50,17 @@ static inline void rh_to_fwd_slashes(char *p) {
 }
 
 /* Index lp->tmpdir (already populated) via the production index_repository flow
- * and open the resulting graph DB (NULL on failure). */
+ * and open the resulting graph DB (NULL on failure).
+ *
+ * KNOWN GAP (hypothesis, unverified): every RProj gets its OWN temp cachedir,
+ * and CBM_CACHE_DIR is restored/unset after indexing. cbm_cross_repo_match
+ * resolves ONE cache dir at call time, so it can never see two RProj DBs at
+ * once — which would make this harness structurally unable to exercise
+ * cross-repo matching. Consistent with repro_issue523 failing all 5 legs at
+ * HEAD f35f9496 (preconditions green, cross-repo 0) while the same scenarios
+ * pass in tests/test_cross_repo.c, whose fixture seeds every project into a
+ * single CBM_CACHE_DIR. Fixing it is separate work: it changes the env
+ * contract of every repro that indexes more than one project. */
 static inline cbm_store_t *rh_open_indexed(RProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
     if (!lp->project)
@@ -127,6 +137,54 @@ static inline cbm_store_t *rh_index_files(RProj *lp, const RFile *files, int nfi
 static inline cbm_store_t *rh_index(RProj *lp, const char *filename, const char *content) {
     RFile f = {filename, content};
     return rh_index_files(lp, &f, 1);
+}
+
+/* rh_index_files with a caller-chosen repo directory basename: the repo root
+ * becomes <tmp>/<dirname>, so the indexed project's root basename is exactly
+ * `dirname`. For fixtures whose URLs must attribute to the project by host —
+ * cross-repo host attribution matches absolute-URL hosts against project
+ * root basenames, and a random mkdtemp basename can never be named by a
+ * fixture URL. */
+static inline cbm_store_t *rh_index_files_named(RProj *lp, const char *dirname, const RFile *files,
+                                                int nfiles) {
+    memset(lp, 0, sizeof(*lp));
+    char outer[256];
+    snprintf(outer, sizeof(outer), "/tmp/cbm_repro_XXXXXX");
+    if (!cbm_mkdtemp(outer))
+        return NULL;
+    rh_to_fwd_slashes(outer);
+    int written = snprintf(lp->tmpdir, sizeof(lp->tmpdir), "%s/%s", outer, dirname);
+    if (written <= 0 || (size_t)written >= sizeof(lp->tmpdir)) {
+        th_rmtree(outer);
+        return NULL;
+    }
+    cbm_mkdir_p(lp->tmpdir, 0755);
+    for (int i = 0; i < nfiles; i++) {
+        char path[700];
+        snprintf(path, sizeof(path), "%s/%s", lp->tmpdir, files[i].name);
+        char *slash = strrchr(path, '/');
+        if (slash && slash > path + strlen(lp->tmpdir)) {
+            *slash = '\0';
+            cbm_mkdir_p(path, 0755);
+            *slash = '/';
+        }
+        FILE *f = fopen(path, "wb"); /* binary: keep "\n" exact */
+        if (!f) {
+            snprintf(lp->tmpdir, sizeof(lp->tmpdir), "%s", outer);
+            rh_cleanup(lp, NULL);
+            return NULL;
+        }
+        fputs(files[i].content, f);
+        fclose(f);
+    }
+    cbm_store_t *store = rh_open_indexed(lp);
+    /* The project name/db were derived from the named subdir above; cleanup
+     * must remove the whole OUTER temp dir. */
+    snprintf(lp->tmpdir, sizeof(lp->tmpdir), "%s", outer);
+    if (!store) {
+        rh_cleanup(lp, NULL);
+    }
+    return store;
 }
 
 static inline void rh_cleanup(RProj *lp, cbm_store_t *store) {

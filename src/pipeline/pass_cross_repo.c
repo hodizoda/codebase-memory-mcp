@@ -203,11 +203,15 @@ static const char *json_str_prop(const char *json, const char *key, char *buf, s
     return buf;
 }
 
-/* Build CROSS_* edge properties JSON. */
+/* Build CROSS_* edge properties JSON. The forward and reverse rows of a
+ * bidirectional pair carry OPPOSITE meanings under the same property names
+ * (forward: target_* = handler; reverse: target_* = caller), so a non-NULL
+ * direction stamps which reading applies. Existing keys stay untouched —
+ * readers json_extract them by name. */
 static void build_cross_props(char *buf, size_t bufsz, const char *target_project,
                               const char *target_function, const char *target_file,
                               const char *url_or_channel, const char *extra_key,
-                              const char *extra_val) {
+                              const char *extra_val, const char *direction) {
     int n = snprintf(buf, bufsz,
                      "{\"target_project\":\"%s\",\"target_function\":\"%s\","
                      "\"target_file\":\"%s\"",
@@ -220,6 +224,9 @@ static void build_cross_props(char *buf, size_t bufsz, const char *target_projec
     if (extra_val && extra_val[0]) {
         n += snprintf(buf + n, bufsz - (size_t)n, ",\"%s\":\"%s\"",
                       extra_key ? "transport" : "method", extra_val);
+    }
+    if (direction && direction[0]) {
+        n += snprintf(buf + n, bufsz - (size_t)n, ",\"direction\":\"%s\"", direction);
     }
     snprintf(buf + n, bufsz - (size_t)n, "}");
 }
@@ -372,11 +379,16 @@ static int64_t find_route_handler(cbm_store_t *target_store, const char *route_q
         return 0;
     }
 
-    /* Follow HANDLES edge to find the handler function */
+    /* Follow HANDLES edges to find the handler function. Competing HANDLES
+     * are real (one fleet route carried 8, 6 of them test functions) and
+     * LIMIT 1 picked arbitrarily, crowning test files like auth_test.go as
+     * the server. Prefer a non-test resolved handler, then a non-test
+     * inline_handler fallback; a route handled ONLY by test files stays
+     * unresolved. */
     if (sqlite3_prepare_v2(db,
-                           "SELECT n.id, n.name, n.file_path FROM edges e "
+                           "SELECT n.id, n.name, n.file_path, e.properties FROM edges e "
                            "JOIN nodes n ON n.id = e.source_id "
-                           "WHERE e.target_id = ?1 AND e.type = 'HANDLES' LIMIT 1",
+                           "WHERE e.target_id = ?1 AND e.type = 'HANDLES' ORDER BY e.id",
                            CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
         *failed = true;
         return 0;
@@ -387,18 +399,27 @@ static int64_t find_route_handler(cbm_store_t *target_store, const char *route_q
         return 0;
     }
     int64_t handler_id = 0;
-    step_rc = sqlite3_step(s);
-    if (step_rc == SQLITE_ROW) {
-        handler_id = sqlite3_column_int64(s, 0);
-        const char *n = (const char *)sqlite3_column_text(s, SKIP_ONE);
+    bool best_is_inline = false;
+    while ((step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         const char *f = (const char *)sqlite3_column_text(s, PAIR_LEN);
-        if (n) {
-            snprintf(handler_name, name_sz, "%s", n);
+        if (cbm_is_test_path(f)) {
+            continue;
         }
-        if (f) {
-            snprintf(handler_file, file_sz, "%s", f);
+        const char *eprops = (const char *)sqlite3_column_text(s, CR_COL_3);
+        bool is_inline = eprops && strstr(eprops, "\"via\":\"inline_handler\"") != NULL;
+        if (handler_id != 0 && is_inline) {
+            continue; /* an inline fallback never displaces the current best */
         }
-    } else if (step_rc != SQLITE_DONE) {
+        handler_id = sqlite3_column_int64(s, 0);
+        best_is_inline = is_inline;
+        const char *n = (const char *)sqlite3_column_text(s, SKIP_ONE);
+        snprintf(handler_name, name_sz, "%s", n ? n : "");
+        snprintf(handler_file, file_sz, "%s", f ? f : "");
+        if (!best_is_inline) {
+            break; /* nothing outranks a non-test resolved handler */
+        }
+    }
+    if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) {
         *failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -447,6 +468,38 @@ static bool cr_path_matches_template(const char *concrete, const char *templ) {
         t++;
     }
     return *c == '\0' && *t == '\0';
+}
+
+/* True when a path has at least one segment and every segment is a "{...}"
+ * placeholder ("/{}", "/{}/{}"). Such a template carries no literal anchor,
+ * so ANY same-arity path from ANY repo "matches" it — a fleet census found
+ * 52 of 75 CROSS_HTTP_CALLS edges were false positives minted this way. A
+ * zero-segment path ("/") is NOT all-placeholder: the root route is a
+ * legitimate exact rendezvous for a relative "/" client call. */
+static bool cr_template_is_all_placeholder(const char *path) {
+    if (!path) {
+        return false;
+    }
+    int segments = 0;
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char *seg = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        size_t len = (size_t)(p - seg);
+        if (!(len >= PAIR_LEN && seg[0] == '{' && seg[len - 1] == '}')) {
+            return false;
+        }
+        segments++;
+    }
+    return segments > 0;
 }
 
 /* Fallback for when the exact route-QN lookup misses: a concrete client path
@@ -505,6 +558,12 @@ static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *c
                 continue;
             }
         }
+        /* A template with no literal segment must never fuzzy-match: it
+         * accepts any same-arity path, which only manufactures cross-repo
+         * false positives. */
+        if (cr_template_is_all_placeholder(rpath)) {
+            continue;
+        }
         if (!cr_path_matches_template(concrete_path, rpath)) {
             continue;
         }
@@ -544,7 +603,7 @@ static bool emit_cross_route_bidirectional(
     /* Forward: caller → local Route in source DB */
     char fwd[CR_PROPS_BUF];
     build_cross_props(fwd, sizeof(fwd), tgt_project, handler_name, handler_file, url_path,
-                      "url_path", method);
+                      "url_path", method, "forward");
     if (!insert_cross_edge(src_store, src_project, caller_id, local_route_id, edge_type, fwd,
                            ctx)) {
         return false;
@@ -588,7 +647,7 @@ static bool emit_cross_route_bidirectional(
 
     char rev[CR_PROPS_BUF];
     build_cross_props(rev, sizeof(rev), src_project, caller_name, caller_file, url_path, "url_path",
-                      method);
+                      method, "reverse");
     return insert_cross_edge(tgt_store, tgt_project, handler_id, tgt_route_id, edge_type, rev, ctx);
 }
 
@@ -644,6 +703,21 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         char *qmark = strchr(cpath, '?');
         if (curl == cpath && qmark && qmark != cpath) {
             *qmark = '\0';
+        }
+        /* A caller that names only scheme+host ("https://api.ipify.org") has
+         * no path to rendezvous on — cr_url_path turns it into "/", which
+         * then matched every target's root route (18/75 fleet false
+         * positives). A RELATIVE "/" call stays a deliberate root request. */
+        if (strstr(url_path, "://") && (curl[0] == '\0' || (curl[0] == '/' && curl[1] == '\0'))) {
+            continue;
+        }
+        /* A client path that canonicalized to ALL placeholders ("/{}/{}",
+         * from e.g. a "/${a}/${b}" template string) would exact-match an
+         * equally degenerate route QN, bypassing the fuzzy scan's
+         * literal-segment rule. Same rule here: no literal anchor, no
+         * rendezvous. */
+        if (cr_template_is_all_placeholder(curl)) {
+            continue;
         }
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
 
@@ -764,7 +838,7 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
 
         char edge_props[CR_PROPS_BUF];
         build_cross_props(edge_props, sizeof(edge_props), tgt_project, handler_name, handler_file,
-                          url_path, "url_path", broker);
+                          url_path, "url_path", broker, NULL);
         if (!insert_cross_edge(src_store, src_project, caller_id, route_id, "CROSS_ASYNC_CALLS",
                                edge_props, ctx)) {
             failed = !cr_cancel_requested(ctx);
@@ -844,7 +918,7 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
     /* Forward edge: emitter → local Channel */
     char fwd[CR_PROPS_BUF];
     build_cross_props(fwd, sizeof(fwd), tgt_project, listener_name, listener_file, channel_name,
-                      "channel_name", transport);
+                      "channel_name", transport, NULL);
     if (!insert_cross_edge(src_store, src_project, emitter_id, channel_id, "CROSS_CHANNEL", fwd,
                            ctx)) {
         return cr_cancel_requested(ctx) ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
@@ -856,7 +930,7 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
     /* Reverse edge: listener → target Channel */
     char rev[CR_PROPS_BUF];
     build_cross_props(rev, sizeof(rev), src_project, caller_name, caller_file, channel_name,
-                      "channel_name", transport);
+                      "channel_name", transport, NULL);
     return insert_cross_edge(tgt_store, tgt_project, listener_id, tgt_channel_id, "CROSS_CHANNEL",
                              rev, ctx)
                ? 1
